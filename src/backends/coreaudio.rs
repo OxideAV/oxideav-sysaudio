@@ -103,10 +103,8 @@ type Fn_AudioQueueEnqueueBuffer = unsafe extern "C" fn(
     inPacketDescs: *const c_void,
 ) -> OSStatus;
 
-type Fn_AudioQueueStart = unsafe extern "C" fn(
-    inAQ: AudioQueueRef,
-    inStartTime: *const c_void,
-) -> OSStatus;
+type Fn_AudioQueueStart =
+    unsafe extern "C" fn(inAQ: AudioQueueRef, inStartTime: *const c_void) -> OSStatus;
 
 type Fn_AudioQueueStop = unsafe extern "C" fn(inAQ: AudioQueueRef, inImmediate: u8) -> OSStatus;
 
@@ -173,10 +171,7 @@ impl AtLib {
                     AudioQueueAllocateBuffer,
                     Fn_AudioQueueAllocateBuffer
                 ),
-                AudioQueueEnqueueBuffer: sym!(
-                    AudioQueueEnqueueBuffer,
-                    Fn_AudioQueueEnqueueBuffer
-                ),
+                AudioQueueEnqueueBuffer: sym!(AudioQueueEnqueueBuffer, Fn_AudioQueueEnqueueBuffer),
                 AudioQueueStart: sym!(AudioQueueStart, Fn_AudioQueueStart),
                 AudioQueueStop: sym!(AudioQueueStop, Fn_AudioQueueStop),
                 AudioQueuePause: sym!(AudioQueuePause, Fn_AudioQueuePause),
@@ -247,11 +242,7 @@ impl Backend for CoreAudioBackend {
     }
 }
 
-unsafe extern "C" fn probe_noop_cb(
-    _user: *mut c_void,
-    _q: AudioQueueRef,
-    _b: AudioQueueBufferRef,
-) {
+unsafe extern "C" fn probe_noop_cb(_user: *mut c_void, _q: AudioQueueRef, _b: AudioQueueBufferRef) {
 }
 
 fn f32_asbd(rate: f64, channels: u16) -> AudioStreamBasicDescription {
@@ -416,9 +407,8 @@ unsafe fn open_inner(
     // `kAudioDevicePropertyLatency` on the audio device ID. That's
     // tracked as a follow-up; for now `latency()` is a floor, not a
     // ceiling, on BT sinks.
-    let sw_latency_ns =
-        ((NUM_BUFFERS * frames_per_buf) as u64).saturating_mul(1_000_000_000)
-            / (req.sample_rate.max(1) as u64);
+    let sw_latency_ns = ((NUM_BUFFERS * frames_per_buf) as u64).saturating_mul(1_000_000_000)
+        / (req.sample_rate.max(1) as u64);
 
     Ok(Box::new(CoreAudioStream {
         lib: l,

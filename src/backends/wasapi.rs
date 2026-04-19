@@ -67,7 +67,12 @@ struct GUID {
 /// required by the COM calls, so we hard-code them instead of parsing
 /// strings.
 const fn guid(d1: u32, d2: u16, d3: u16, d4: [u8; 8]) -> GUID {
-    GUID { data1: d1, data2: d2, data3: d3, data4: d4 }
+    GUID {
+        data1: d1,
+        data2: d2,
+        data3: d3,
+        data4: d4,
+    }
 }
 
 const CLSID_MMDeviceEnumerator: GUID = guid(
@@ -185,10 +190,7 @@ struct IMMDeviceVtbl {
         stgmAccess: DWORD,
         ppProperties: *mut *mut c_void,
     ) -> HRESULT,
-    GetId: unsafe extern "system" fn(
-        this: *mut c_void,
-        ppstrId: *mut *mut u16,
-    ) -> HRESULT,
+    GetId: unsafe extern "system" fn(this: *mut c_void, ppstrId: *mut *mut u16) -> HRESULT,
     GetState: unsafe extern "system" fn(this: *mut c_void, pdwState: *mut DWORD) -> HRESULT,
 }
 
@@ -206,10 +208,8 @@ struct IAudioClientVtbl {
     ) -> HRESULT,
     GetBufferSize:
         unsafe extern "system" fn(this: *mut c_void, pNumBufferFrames: *mut u32) -> HRESULT,
-    GetStreamLatency: unsafe extern "system" fn(
-        this: *mut c_void,
-        phnsLatency: *mut REFERENCE_TIME,
-    ) -> HRESULT,
+    GetStreamLatency:
+        unsafe extern "system" fn(this: *mut c_void, phnsLatency: *mut REFERENCE_TIME) -> HRESULT,
     GetCurrentPadding:
         unsafe extern "system" fn(this: *mut c_void, pNumPaddingFrames: *mut u32) -> HRESULT,
     IsFormatSupported: unsafe extern "system" fn(
@@ -318,12 +318,13 @@ impl WinLibs {
             macro_rules! sym {
                 ($lib:ident, $name:literal, $ty:ty) => {{
                     let s: Symbol<$ty> =
-                        $lib.get(concat!($name, "\0").as_bytes())
-                            .map_err(|e| Error::SymbolMissing {
+                        $lib.get(concat!($name, "\0").as_bytes()).map_err(|e| {
+                            Error::SymbolMissing {
                                 backend: "wasapi",
                                 symbol: $name,
                                 source: e,
-                            })?;
+                            }
+                        })?;
                     *s
                 }};
             }
@@ -334,11 +335,7 @@ impl WinLibs {
                 CoTaskMemFree: sym!(ole32, "CoTaskMemFree", Fn_CoTaskMemFree),
                 CreateEventA: sym!(kernel32, "CreateEventA", Fn_CreateEventA),
                 CloseHandle: sym!(kernel32, "CloseHandle", Fn_CloseHandle),
-                WaitForSingleObject: sym!(
-                    kernel32,
-                    "WaitForSingleObject",
-                    Fn_WaitForSingleObject
-                ),
+                WaitForSingleObject: sym!(kernel32, "WaitForSingleObject", Fn_WaitForSingleObject),
                 SetEvent: sym!(kernel32, "SetEvent", Fn_SetEvent),
                 _ole32: ole32,
                 _kernel32: kernel32,
@@ -410,9 +407,7 @@ impl Backend for WasapiBackend {
 /// its mix format. Caller owns both the returned client (must be
 /// Released) and the WAVEFORMATEX* (must be CoTaskMemFree'd — we return
 /// it boxed so the caller can reuse it for Initialize).
-unsafe fn activate_default_client(
-    l: &WinLibs,
-) -> Result<(*mut c_void, *mut WAVEFORMATEX)> {
+unsafe fn activate_default_client(l: &WinLibs) -> Result<(*mut c_void, *mut WAVEFORMATEX)> {
     // 1. CoCreateInstance(CLSID_MMDeviceEnumerator, …, IID_IMMDeviceEnumerator)
     let mut enumer: *mut c_void = ptr::null_mut();
     let hr = (l.CoCreateInstance)(
@@ -696,7 +691,9 @@ impl WasapiWorkerState {
                 // 100 ms timeout so we notice `stop` promptly even if
                 // the server stops pulling.
                 let w = (self.lib.WaitForSingleObject)(self.event.0, 100);
-                if w != WAIT_OBJECT_0 && w != 258 /* WAIT_TIMEOUT */ {
+                if w != WAIT_OBJECT_0 && w != 258
+                /* WAIT_TIMEOUT */
+                {
                     return;
                 }
                 let mut padding: u32 = 0;
@@ -704,8 +701,7 @@ impl WasapiWorkerState {
                 if hr != S_OK {
                     return;
                 }
-                self.padding_frames
-                    .store(padding as u64, Ordering::Relaxed);
+                self.padding_frames.store(padding as u64, Ordering::Relaxed);
                 let avail = self.buffer_frames.saturating_sub(padding);
                 if avail == 0 {
                     continue;
@@ -735,11 +731,7 @@ impl WasapiWorkerState {
                 }
 
                 if self.is_f32 {
-                    ptr::copy_nonoverlapping(
-                        slice.as_ptr() as *const u8,
-                        data,
-                        samples * 4,
-                    );
+                    ptr::copy_nonoverlapping(slice.as_ptr() as *const u8, data, samples * 4);
                 } else {
                     // S16LE fallback.
                     let dst = std::slice::from_raw_parts_mut(data as *mut i16, samples);

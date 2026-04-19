@@ -68,8 +68,7 @@ type Fn_pa_simple_drain = unsafe extern "C" fn(s: *mut pa_simple, error: *mut c_
 type Fn_pa_simple_flush = unsafe extern "C" fn(s: *mut pa_simple, error: *mut c_int) -> c_int;
 /// Returns latency in microseconds (`pa_usec_t = u64`), or `(pa_usec_t)-1`
 /// via `error` on failure.
-type Fn_pa_simple_get_latency =
-    unsafe extern "C" fn(s: *mut pa_simple, error: *mut c_int) -> u64;
+type Fn_pa_simple_get_latency = unsafe extern "C" fn(s: *mut pa_simple, error: *mut c_int) -> u64;
 type Fn_pa_strerror = unsafe extern "C" fn(error: c_int) -> *const c_char;
 
 struct PulseLib {
@@ -115,10 +114,7 @@ impl PulseLib {
                 pa_simple_write: sym!(pa_simple_write, Fn_pa_simple_write),
                 pa_simple_drain: sym!(pa_simple_drain, Fn_pa_simple_drain),
                 pa_simple_flush: sym!(pa_simple_flush, Fn_pa_simple_flush),
-                pa_simple_get_latency: sym!(
-                    pa_simple_get_latency,
-                    Fn_pa_simple_get_latency
-                ),
+                pa_simple_get_latency: sym!(pa_simple_get_latency, Fn_pa_simple_get_latency),
                 pa_strerror: sym!(pa_strerror, Fn_pa_strerror),
                 _lib: lib,
             }))
@@ -268,7 +264,7 @@ impl Backend for PulseBackend {
             latency_usec,
             format: StreamFormat {
                 sample_rate: req.sample_rate,
-                channels: channels,
+                channels,
                 format: SampleFormat::F32,
             },
         }))
@@ -294,7 +290,7 @@ struct PulseWorkerState {
 impl PulseWorkerState {
     fn run(mut self) {
         let mut buf = vec![0.0f32; self.period_frames * self.channels];
-        let bytes = (self.period_frames * self.channels * 4) as usize;
+        let bytes = self.period_frames * self.channels * 4;
 
         while !self.stop.load(Ordering::Relaxed) {
             if self.paused.load(Ordering::Relaxed) {

@@ -58,21 +58,16 @@ type Fn_snd_pcm_open = unsafe extern "C" fn(
 ) -> c_int;
 type Fn_snd_pcm_close = unsafe extern "C" fn(pcm: *mut snd_pcm_t) -> c_int;
 type Fn_snd_pcm_prepare = unsafe extern "C" fn(pcm: *mut snd_pcm_t) -> c_int;
-type Fn_snd_pcm_writei = unsafe extern "C" fn(
-    pcm: *mut snd_pcm_t,
-    buffer: *const c_void,
-    size: c_ulong,
-) -> c_long;
+type Fn_snd_pcm_writei =
+    unsafe extern "C" fn(pcm: *mut snd_pcm_t, buffer: *const c_void, size: c_ulong) -> c_long;
 type Fn_snd_pcm_recover =
     unsafe extern "C" fn(pcm: *mut snd_pcm_t, err: c_int, silent: c_int) -> c_int;
 type Fn_snd_pcm_drop = unsafe extern "C" fn(pcm: *mut snd_pcm_t) -> c_int;
 type Fn_snd_pcm_pause = unsafe extern "C" fn(pcm: *mut snd_pcm_t, enable: c_int) -> c_int;
-type Fn_snd_pcm_delay =
-    unsafe extern "C" fn(pcm: *mut snd_pcm_t, delayp: *mut c_long) -> c_int;
+type Fn_snd_pcm_delay = unsafe extern "C" fn(pcm: *mut snd_pcm_t, delayp: *mut c_long) -> c_int;
 type Fn_snd_strerror = unsafe extern "C" fn(errnum: c_int) -> *const c_char;
 
-type Fn_hw_params_malloc =
-    unsafe extern "C" fn(ptr: *mut *mut snd_pcm_hw_params_t) -> c_int;
+type Fn_hw_params_malloc = unsafe extern "C" fn(ptr: *mut *mut snd_pcm_hw_params_t) -> c_int;
 type Fn_hw_params_free = unsafe extern "C" fn(obj: *mut snd_pcm_hw_params_t);
 type Fn_hw_params_any =
     unsafe extern "C" fn(pcm: *mut snd_pcm_t, params: *mut snd_pcm_hw_params_t) -> c_int;
@@ -113,10 +108,8 @@ type Fn_hw_params_get_period_size = unsafe extern "C" fn(
     val: *mut c_ulong,
     dir: *mut c_int,
 ) -> c_int;
-type Fn_hw_params = unsafe extern "C" fn(
-    pcm: *mut snd_pcm_t,
-    params: *mut snd_pcm_hw_params_t,
-) -> c_int;
+type Fn_hw_params =
+    unsafe extern "C" fn(pcm: *mut snd_pcm_t, params: *mut snd_pcm_hw_params_t) -> c_int;
 
 // ---------------------------------------------------------------------------
 // Loaded library + resolved symbols.
@@ -163,13 +156,13 @@ impl AlsaLib {
             })?;
             macro_rules! sym {
                 ($name:ident, $ty:ty) => {{
-                    let s: Symbol<$ty> =
-                        lib.get(concat!(stringify!($name), "\0").as_bytes())
-                            .map_err(|e| Error::SymbolMissing {
-                                backend: "alsa",
-                                symbol: stringify!($name),
-                                source: e,
-                            })?;
+                    let s: Symbol<$ty> = lib
+                        .get(concat!(stringify!($name), "\0").as_bytes())
+                        .map_err(|e| Error::SymbolMissing {
+                            backend: "alsa",
+                            symbol: stringify!($name),
+                            source: e,
+                        })?;
                     // Deref copies the fn-pointer out; the borrow on
                     // `lib` ends here, and the fn pointer remains valid
                     // as long as we keep the Library alive in AlsaLib.
@@ -189,10 +182,8 @@ impl AlsaLib {
             let hw_params_malloc = sym!(snd_pcm_hw_params_malloc, Fn_hw_params_malloc);
             let hw_params_free = sym!(snd_pcm_hw_params_free, Fn_hw_params_free);
             let hw_params_any = sym!(snd_pcm_hw_params_any, Fn_hw_params_any);
-            let hw_params_set_access =
-                sym!(snd_pcm_hw_params_set_access, Fn_hw_params_set_access);
-            let hw_params_set_format =
-                sym!(snd_pcm_hw_params_set_format, Fn_hw_params_set_format);
+            let hw_params_set_access = sym!(snd_pcm_hw_params_set_access, Fn_hw_params_set_access);
+            let hw_params_set_format = sym!(snd_pcm_hw_params_set_format, Fn_hw_params_set_format);
             let hw_params_set_channels =
                 sym!(snd_pcm_hw_params_set_channels, Fn_hw_params_set_channels);
             let hw_params_set_rate_near =
@@ -205,8 +196,10 @@ impl AlsaLib {
                 snd_pcm_hw_params_set_buffer_size_near,
                 Fn_hw_params_set_buffer_size_near
             );
-            let hw_params_get_period_size =
-                sym!(snd_pcm_hw_params_get_period_size, Fn_hw_params_get_period_size);
+            let hw_params_get_period_size = sym!(
+                snd_pcm_hw_params_get_period_size,
+                Fn_hw_params_get_period_size
+            );
             let hw_params = sym!(snd_pcm_hw_params, Fn_hw_params);
 
             Ok(Arc::new(AlsaLib {
@@ -343,11 +336,7 @@ unsafe fn configure_and_spawn(
     }
     let hw_guard = HwParamsGuard { l: l.clone(), hw };
 
-    check(
-        &l,
-        (l.hw_params_any)(pcm, hw),
-        "hw_params_any",
-    )?;
+    check(&l, (l.hw_params_any)(pcm, hw), "hw_params_any")?;
     check(
         &l,
         (l.hw_params_set_access)(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED),
@@ -541,8 +530,7 @@ impl AlsaWorkerState {
                 }
                 continue;
             }
-            self.frames_played
-                .fetch_add(r as u64, Ordering::Relaxed);
+            self.frames_played.fetch_add(r as u64, Ordering::Relaxed);
 
             // Publish driver-side queue depth for `Stream::latency()`.
             // Safe to call from this thread only (snd_pcm handles are

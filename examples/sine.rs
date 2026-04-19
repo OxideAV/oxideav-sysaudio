@@ -37,8 +37,8 @@ fn main() {
                 out[f * ch + c] = v;
             }
             p += step;
-            if p > 6.283185307 {
-                p -= 6.283185307;
+            if p > std::f32::consts::TAU {
+                p -= std::f32::consts::TAU;
             }
         }
         phase_cb.store(p as u64, Ordering::Relaxed);

@@ -44,7 +44,10 @@ pub struct Stream {
 
 impl Stream {
     pub(crate) fn new(inner: Box<dyn StreamImpl>) -> Self {
-        Self { inner, stopped: false }
+        Self {
+            inner,
+            stopped: false,
+        }
     }
 
     pub fn play(&mut self) -> Result<()> {

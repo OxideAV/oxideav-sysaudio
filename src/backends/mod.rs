@@ -5,19 +5,19 @@
 
 use crate::backend::Backend;
 
-#[cfg(all(target_os = "linux", feature = "pipewire"))]
-pub(crate) mod pipewire;
-#[cfg(all(target_os = "linux", feature = "pulse"))]
-pub(crate) mod pulse;
 #[cfg(all(target_os = "linux", feature = "alsa"))]
 pub(crate) mod alsa;
 #[cfg(all(target_os = "linux", feature = "oss"))]
 pub(crate) mod oss;
+#[cfg(all(target_os = "linux", feature = "pipewire"))]
+pub(crate) mod pipewire;
+#[cfg(all(target_os = "linux", feature = "pulse"))]
+pub(crate) mod pulse;
 
-#[cfg(all(target_os = "windows", feature = "wasapi"))]
-pub(crate) mod wasapi;
 #[cfg(all(target_os = "windows", feature = "asio"))]
 pub(crate) mod asio;
+#[cfg(all(target_os = "windows", feature = "wasapi"))]
+pub(crate) mod wasapi;
 
 #[cfg(all(target_os = "macos", feature = "coreaudio"))]
 pub(crate) mod coreaudio;

@@ -49,10 +49,18 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::NotImplemented(b) => write!(f, "{b}: backend not yet implemented"),
-            Error::LibraryLoad { backend, soname, source } => {
+            Error::LibraryLoad {
+                backend,
+                soname,
+                source,
+            } => {
                 write!(f, "{backend}: loading {soname}: {source}")
             }
-            Error::SymbolMissing { backend, symbol, source } => {
+            Error::SymbolMissing {
+                backend,
+                symbol,
+                source,
+            } => {
                 write!(f, "{backend}: symbol {symbol} missing: {source}")
             }
             Error::DeviceOpen { backend, detail } => write!(f, "{backend}: open: {detail}"),
