@@ -1,0 +1,30 @@
+[package]
+name = "oxideav-sysaudio"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-sysaudio"
+homepage = "https://github.com/OxideAV/oxideav-sysaudio"
+authors = ["Mark Karpeles"]
+description = "Pure-Rust audio output: runtime-loaded native backends (ALSA, PulseAudio, WASAPI, CoreAudio, …) with no C build-time linkage"
+readme = "README.md"
+keywords = ["audio", "output", "alsa", "pulseaudio", "wasapi"]
+categories = ["multimedia::audio"]
+
+[features]
+# Every backend compiles into every build by default. At runtime, `probe()`
+# skips the ones whose shared library fails to load or whose dummy-open
+# fails, so having more features on than the OS provides is harmless.
+default = ["alsa", "pulse", "pipewire", "oss", "wasapi", "asio", "coreaudio"]
+alsa = []
+pulse = []
+pipewire = []
+oss = []
+wasapi = []
+asio = []
+coreaudio = []
+
+[dependencies]
+libloading = "0.8"
+thiserror = "1"
