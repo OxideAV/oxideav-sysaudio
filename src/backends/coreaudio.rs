@@ -150,7 +150,7 @@ impl AtLib {
             "AudioToolbox",
         ];
         let mut last_err: Option<libloading::Error> = None;
-        for path in CANDIDATES {
+        for &path in CANDIDATES {
             match unsafe { Library::new(path) } {
                 Ok(lib) => return Self::bind(lib),
                 Err(e) => last_err = Some(e),
@@ -280,7 +280,7 @@ impl CaLib {
             "CoreAudio",
         ];
         let mut last_err: Option<libloading::Error> = None;
-        for path in CANDIDATES {
+        for &path in CANDIDATES {
             match unsafe { Library::new(path) } {
                 Ok(lib) => return Self::bind(lib),
                 Err(e) => last_err = Some(e),
