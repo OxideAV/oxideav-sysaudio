@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/OxideAV/oxideav-sysaudio/compare/v0.1.0...v0.1.1) - 2026-04-24
+
+### Added
+
+- *(coreaudio)* query real HAL hardware latency for BT/USB sinks
+
+### Other
+
+- bump thiserror 1 → 2
+- bump libloading 0.8 → 0.9
+- release v0.0.1
+
 ## [0.1.0](https://github.com/OxideAV/oxideav-sysaudio/compare/v0.0.1...v0.1.0) - 2026-04-19
 
 ### Other
