@@ -61,7 +61,7 @@ network PulseAudio, HDMI passthrough, etc.):
 | PulseAudio| `pa_simple_get_latency` (end-to-end, server-side)                                  | Yes              |
 | ALSA      | `snd_pcm_delay` (driver queue depth)                                               | Partial          |
 | WASAPI    | `IAudioClient::GetStreamLatency` + live `GetCurrentPadding`                        | Yes              |
-| CoreAudio | `num_buffers × period` (software-side estimate — HAL-side BT latency is follow-up) | No (floor only)  |
+| CoreAudio | `num_buffers × period` + HAL (`kAudioDevicePropertyLatency` + buffer frame size + safety offset + stream latency) | Yes              |
 
 ## Features
 

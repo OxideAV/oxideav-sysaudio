@@ -11,11 +11,24 @@
 //! The user's Rust `FnMut(&mut [f32], &CallbackInfo)` is boxed, stashed
 //! in a heap-owned `CallbackState`, and reached through an
 //! `extern "system"` trampoline.
+//!
+//! For `latency()` we *also* dlopen `CoreAudio.framework` (the HAL
+//! dylib underneath AudioToolbox) so we can reach
+//! `AudioObjectGetPropertyData` and query the real hardware-side
+//! delay on the device the queue is currently bound to — critical
+//! for BT sinks, USB DACs and HDMI, where the AudioQueue's buffer
+//! depth is tiny compared to the total pipeline. If CoreAudio.framework
+//! fails to load (shouldn't on any modern macOS, but we defend
+//! against it) we silently fall back to the software-only floor.
 
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
+// FourCC selectors and `kAudio…` constants are spelled exactly as
+// Apple's headers publish them, for grep-ability against the HAL /
+// AudioQueue docs.
+#![allow(non_upper_case_globals)]
 
-use std::ffi::{c_char, c_int, c_void};
+use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -192,6 +205,284 @@ fn lib() -> Result<Arc<AtLib>> {
     let l = AtLib::load()?;
     *g = Some(l.clone());
     Ok(l)
+}
+
+// ---------------------------------------------------------------------------
+// CoreAudio.framework (HAL) — loaded separately for hardware latency.
+// ---------------------------------------------------------------------------
+
+/// AudioDeviceID / AudioObjectID / AudioStreamID — all just UInt32 in
+/// Apple's HAL.
+type AudioObjectID = u32;
+
+/// `AudioObjectPropertyAddress` — 12 bytes; the (selector, scope, element)
+/// triple every `AudioObjectGetPropertyData*` call takes.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AudioObjectPropertyAddress {
+    mSelector: u32,
+    mScope: u32,
+    mElement: u32,
+}
+
+/// FourCC helper — build a big-endian packed u32 the same way
+/// `kAudioFormatLinearPCM` above does.
+const fn four_cc(b: &[u8; 4]) -> u32 {
+    u32::from_be_bytes(*b)
+}
+
+// HAL "root" object + property to reach the current default output.
+// kAudioObjectSystemObject is the documented singleton ID 1.
+const kAudioObjectSystemObject: u32 = 1;
+const kAudioHardwarePropertyDefaultOutputDevice: u32 = four_cc(b"dOut");
+
+// Scope/element selectors on the HAL object tree.
+const kAudioObjectPropertyScopeGlobal: u32 = four_cc(b"glob");
+const kAudioObjectPropertyScopeOutput: u32 = four_cc(b"outp");
+// Element 0 is "main" (formerly "master"); either name addresses the
+// same element on every macOS version we care about.
+const kAudioObjectPropertyElementMain: u32 = 0;
+
+// Device-side hardware latency selectors.
+const kAudioDevicePropertyLatency: u32 = four_cc(b"ltnc");
+const kAudioDevicePropertyBufferFrameSize: u32 = four_cc(b"fsiz");
+const kAudioDevicePropertySafetyOffset: u32 = four_cc(b"saft");
+// Stream enumeration + per-stream latency (scope = output).
+const kAudioDevicePropertyStreams: u32 = four_cc(b"stm#");
+const kAudioStreamPropertyLatency: u32 = four_cc(b"ltnc");
+
+/// `AudioObjectGetPropertyData(inObjectID, inAddress, 0, NULL,
+/// ioDataSize, outData)` — the getter every HAL query funnels
+/// through. The two `UInt32` args after the address are the
+/// "qualifier" pair (we always pass (0, NULL)).
+type Fn_AudioObjectGetPropertyData = unsafe extern "C" fn(
+    inObjectID: AudioObjectID,
+    inAddress: *const AudioObjectPropertyAddress,
+    inQualifierDataSize: u32,
+    inQualifierData: *const c_void,
+    ioDataSize: *mut u32,
+    outData: *mut c_void,
+) -> OSStatus;
+
+struct CaLib {
+    _lib: Library,
+    AudioObjectGetPropertyData: Fn_AudioObjectGetPropertyData,
+}
+
+unsafe impl Send for CaLib {}
+unsafe impl Sync for CaLib {}
+
+impl CaLib {
+    fn load() -> std::result::Result<Arc<Self>, libloading::Error> {
+        const CANDIDATES: &[&str] = &[
+            "/System/Library/Frameworks/CoreAudio.framework/CoreAudio",
+            "CoreAudio.framework/CoreAudio",
+            "CoreAudio",
+        ];
+        let mut last_err: Option<libloading::Error> = None;
+        for path in CANDIDATES {
+            match unsafe { Library::new(path) } {
+                Ok(lib) => return Self::bind(lib),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.expect("CANDIDATES is non-empty"))
+    }
+
+    fn bind(lib: Library) -> std::result::Result<Arc<Self>, libloading::Error> {
+        unsafe {
+            let s: Symbol<Fn_AudioObjectGetPropertyData> =
+                lib.get(b"AudioObjectGetPropertyData\0")?;
+            let f = *s;
+            Ok(Arc::new(CaLib {
+                AudioObjectGetPropertyData: f,
+                _lib: lib,
+            }))
+        }
+    }
+}
+
+/// Load (and cache) `CoreAudio.framework`. Unlike `lib()`, this never
+/// returns `Err` to the caller — it maps a load failure into `None` so
+/// `latency()` can degrade to the software floor without poisoning
+/// `open()`.
+fn ca_lib() -> Option<Arc<CaLib>> {
+    static CACHED: OnceLock<Mutex<Option<Option<Arc<CaLib>>>>> = OnceLock::new();
+    let slot = CACHED.get_or_init(|| Mutex::new(None));
+    let mut g = slot.lock().unwrap();
+    if let Some(slot) = g.as_ref() {
+        return slot.clone();
+    }
+    let loaded = CaLib::load().ok();
+    *g = Some(loaded.clone());
+    loaded
+}
+
+/// Query `prop` from `object` as a single `u32`. Returns `None` if the
+/// property is missing, the wrong size, or the getter fails.
+unsafe fn hal_get_u32(ca: &CaLib, object: AudioObjectID, selector: u32, scope: u32) -> Option<u32> {
+    let addr = AudioObjectPropertyAddress {
+        mSelector: selector,
+        mScope: scope,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let mut value: u32 = 0;
+    let mut size: u32 = std::mem::size_of::<u32>() as u32;
+    let r = (ca.AudioObjectGetPropertyData)(
+        object,
+        &addr,
+        0,
+        ptr::null(),
+        &mut size,
+        &mut value as *mut u32 as *mut c_void,
+    );
+    if r == 0 && size as usize == std::mem::size_of::<u32>() {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// Query the first output stream on `device` (if any). CoreAudio
+/// exposes streams through `kAudioDevicePropertyStreams` on the output
+/// scope; we only need the first one's latency — multi-stream output
+/// devices are rare for playback and all streams on the same physical
+/// device share the same HAL latency anyway.
+unsafe fn hal_first_output_stream(ca: &CaLib, device: AudioObjectID) -> Option<AudioObjectID> {
+    let addr = AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyStreams,
+        mScope: kAudioObjectPropertyScopeOutput,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    // Two-step idiom: first call with outData=NULL to learn the byte
+    // size, then allocate and re-query. The HAL insists on this even
+    // when we only want one element.
+    let mut size: u32 = 0;
+    // Apple's API treats "get size" specially: pass NULL outData and
+    // a 0 ioDataSize-in / size-out receives the real size. Several
+    // HAL impls tolerate a non-NULL outData too as long as
+    // *ioDataSize == 0, but NULL is the documented form.
+    let r =
+        (ca.AudioObjectGetPropertyData)(device, &addr, 0, ptr::null(), &mut size, ptr::null_mut());
+    if r != 0 || size < std::mem::size_of::<AudioObjectID>() as u32 {
+        return None;
+    }
+    let count = size as usize / std::mem::size_of::<AudioObjectID>();
+    let mut buf: Vec<AudioObjectID> = vec![0; count];
+    let r = (ca.AudioObjectGetPropertyData)(
+        device,
+        &addr,
+        0,
+        ptr::null(),
+        &mut size,
+        buf.as_mut_ptr() as *mut c_void,
+    );
+    if r != 0 {
+        return None;
+    }
+    buf.into_iter().next().filter(|id| *id != 0)
+}
+
+/// Total hardware-side latency (in frames) for the current output
+/// device. Sums `device_latency`, `buffer_frame_size`, `safety_offset`
+/// and `stream_latency` per the HAL reference. Returns `None` if we
+/// can't resolve a device to query, in which case callers should fall
+/// back to the software-only floor.
+///
+/// **Device resolution**: Apple's docs state that
+/// `kAudioQueueProperty_CurrentDevice` has value type `CFStringRef`
+/// (a device UID), not `AudioDeviceID` — decoding that would drag in
+/// CoreFoundation bindings this crate has deliberately avoided. The
+/// AudioQueue we build never has `AudioQueueSetProperty` called on
+/// it, so it always follows the system default output. We therefore
+/// resolve via `kAudioHardwarePropertyDefaultOutputDevice` on the HAL
+/// root, which yields the same numeric `AudioDeviceID` the queue is
+/// using. This is already the shape Chromium/Firefox/etc. end up at
+/// after doing the UID→DeviceID dance; we just skip the middle.
+unsafe fn query_hardware_latency_frames(ca: &CaLib) -> Option<u32> {
+    let default_addr = AudioObjectPropertyAddress {
+        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let mut device: AudioObjectID = 0;
+    let mut size: u32 = std::mem::size_of::<AudioObjectID>() as u32;
+    let r = (ca.AudioObjectGetPropertyData)(
+        kAudioObjectSystemObject,
+        &default_addr,
+        0,
+        ptr::null(),
+        &mut size,
+        &mut device as *mut AudioObjectID as *mut c_void,
+    );
+    if r != 0 || device == 0 {
+        return None;
+    }
+
+    // Device-side fixed latency + live buffer size + safety offset on
+    // the OUTPUT scope. Any of these may be unreported on exotic
+    // hardware; treat a missing property as 0 rather than bailing out
+    // so BT headphones (which report their 100ms-ish latency through
+    // `kAudioDevicePropertyLatency`) still get counted even if e.g.
+    // their buffer-frame-size query fails.
+    let dev_latency = hal_get_u32(
+        ca,
+        device,
+        kAudioDevicePropertyLatency,
+        kAudioObjectPropertyScopeOutput,
+    )
+    .or_else(|| {
+        hal_get_u32(
+            ca,
+            device,
+            kAudioDevicePropertyLatency,
+            kAudioObjectPropertyScopeGlobal,
+        )
+    })
+    .unwrap_or(0);
+    let buffer_frames = hal_get_u32(
+        ca,
+        device,
+        kAudioDevicePropertyBufferFrameSize,
+        kAudioObjectPropertyScopeOutput,
+    )
+    .or_else(|| {
+        hal_get_u32(
+            ca,
+            device,
+            kAudioDevicePropertyBufferFrameSize,
+            kAudioObjectPropertyScopeGlobal,
+        )
+    })
+    .unwrap_or(0);
+    let safety_offset = hal_get_u32(
+        ca,
+        device,
+        kAudioDevicePropertySafetyOffset,
+        kAudioObjectPropertyScopeOutput,
+    )
+    .unwrap_or(0);
+
+    // Per-stream latency on the device's first output stream. Optional
+    // — not all HAL drivers populate it, and it's typically 0-few
+    // frames (format-conversion buffers) on top of the device figure.
+    let stream_latency = hal_first_output_stream(ca, device)
+        .and_then(|stream| {
+            hal_get_u32(
+                ca,
+                stream,
+                kAudioStreamPropertyLatency,
+                kAudioObjectPropertyScopeGlobal,
+            )
+        })
+        .unwrap_or(0);
+
+    Some(
+        dev_latency
+            .saturating_add(buffer_frames)
+            .saturating_add(safety_offset)
+            .saturating_add(stream_latency),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -400,18 +691,25 @@ unsafe fn open_inner(
         });
     }
 
-    // Conservative software-side latency estimate: the number of
-    // queued buffers times the per-buffer duration. Does NOT include
-    // any hardware-side delay (Bluetooth, USB-DAC, HDMI routing) —
-    // those would require loading CoreAudio.framework to query
-    // `kAudioDevicePropertyLatency` on the audio device ID. That's
-    // tracked as a follow-up; for now `latency()` is a floor, not a
-    // ceiling, on BT sinks.
+    // Software-side floor: three queued buffers × per-buffer duration.
+    // This is a hard lower bound on how long it takes a sample the
+    // caller hands us to reach the device. The hardware-side component
+    // (BT radio delay, USB-DAC pipeline depth, HDMI routing, HAL
+    // safety offset) comes from `query_hardware_latency_frames` at
+    // `latency()` time — done live because the bound device, and thus
+    // the hardware delay, can change after `open()` (default-output
+    // switch, hot-plug).
     let sw_latency_ns = ((NUM_BUFFERS * frames_per_buf) as u64).saturating_mul(1_000_000_000)
         / (req.sample_rate.max(1) as u64);
 
+    // Attempt to load CoreAudio.framework for HAL latency queries.
+    // Graceful degradation: if it fails (shouldn't on any modern
+    // macOS), `latency()` simply returns the software floor.
+    let ca = ca_lib();
+
     Ok(Box::new(CoreAudioStream {
         lib: l,
+        ca,
         queue: QueuePtr(queue),
         state_ptr,
         paused,
@@ -431,12 +729,17 @@ unsafe impl Send for QueuePtr {}
 
 struct CoreAudioStream {
     lib: Arc<AtLib>,
+    /// CoreAudio.framework HAL bindings for hardware-latency queries.
+    /// `None` if the framework failed to load (graceful-degradation
+    /// path — `latency()` falls back to the software floor).
+    ca: Option<Arc<CaLib>>,
     queue: QueuePtr,
     /// Heap-owned callback state pointed at by the CA thread.
     state_ptr: *mut CallbackState,
     paused: Arc<AtomicBool>,
-    /// Software-side latency estimate in nanoseconds (see computation
-    /// in `open_inner`). Does not include hardware/BT-side delay.
+    /// Software-side latency floor in nanoseconds — the `NUM_BUFFERS
+    /// × frames_per_buf` component. See `open_inner`. The HAL-reported
+    /// hardware component is added at `latency()`-call time.
     sw_latency_ns: u64,
     format: StreamFormat,
     stopped: bool,
@@ -463,10 +766,24 @@ impl StreamImpl for CoreAudioStream {
         self.format
     }
     fn latency(&self) -> Option<Duration> {
-        // Software-side estimate only — see the note in `open_inner`.
-        // A follow-up should reach through `kAudioDevicePropertyLatency`
-        // on the queue's current device to cover Bluetooth sinks.
-        Some(Duration::from_nanos(self.sw_latency_ns))
+        // Software floor (AudioQueue buffer depth) + hardware
+        // component (HAL: device latency + buffer frame size +
+        // safety offset + stream latency) converted through the
+        // stream sample rate. If CoreAudio.framework didn't load or
+        // the HAL query fails, we transparently fall back to the
+        // software floor so the caller always gets *some* answer.
+        let mut total_ns = self.sw_latency_ns;
+        if let Some(ca) = self.ca.as_ref() {
+            // SAFETY: `ca` owns its `Library` handle, so the fn
+            // pointer stays mapped for the duration of the call.
+            let hw_frames = unsafe { query_hardware_latency_frames(ca) };
+            if let Some(frames) = hw_frames {
+                let rate = self.format.sample_rate.max(1) as u64;
+                let hw_ns = (frames as u64).saturating_mul(1_000_000_000) / rate;
+                total_ns = total_ns.saturating_add(hw_ns);
+            }
+        }
+        Some(Duration::from_nanos(total_ns))
     }
     fn stop(&mut self) {
         if self.stopped {
@@ -481,5 +798,72 @@ impl StreamImpl for CoreAudioStream {
             // Now safe to drop the Box the trampoline was reading.
             drop(Box::from_raw(self.state_ptr));
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — constant/layout checks only. The end-to-end HAL query path
+// needs a real audio device and is covered by manual verification via
+// `oxideplay` on macOS.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fourcc_constants_match_apple_headers() {
+        // Every HAL FourCC should decode to the big-endian-packed
+        // ASCII the Core Audio headers document. If any of these
+        // regress, the HAL query returns garbage.
+        assert_eq!(kAudioObjectSystemObject, 1);
+        assert_eq!(
+            kAudioHardwarePropertyDefaultOutputDevice,
+            u32::from_be_bytes(*b"dOut")
+        );
+        assert_eq!(
+            kAudioObjectPropertyScopeGlobal,
+            u32::from_be_bytes(*b"glob")
+        );
+        assert_eq!(
+            kAudioObjectPropertyScopeOutput,
+            u32::from_be_bytes(*b"outp")
+        );
+        assert_eq!(kAudioObjectPropertyElementMain, 0);
+        assert_eq!(kAudioDevicePropertyLatency, u32::from_be_bytes(*b"ltnc"));
+        assert_eq!(
+            kAudioDevicePropertyBufferFrameSize,
+            u32::from_be_bytes(*b"fsiz")
+        );
+        assert_eq!(
+            kAudioDevicePropertySafetyOffset,
+            u32::from_be_bytes(*b"saft")
+        );
+        assert_eq!(kAudioDevicePropertyStreams, u32::from_be_bytes(*b"stm#"));
+        assert_eq!(kAudioStreamPropertyLatency, u32::from_be_bytes(*b"ltnc"));
+        // Cross-check against the existing `kAudioFormatLinearPCM`
+        // literal to make sure our `four_cc` helper matches the
+        // hand-written form used elsewhere in this file.
+        assert_eq!(four_cc(b"lpcm"), kAudioFormatLinearPCM);
+    }
+
+    #[test]
+    fn property_address_layout_is_3_u32s() {
+        // Must match the C layout `<CoreAudio/AudioHardwareBase.h>`
+        // publishes: three UInt32 fields, no padding, total 12 bytes.
+        // Drift here would silently feed AudioObjectGetPropertyData
+        // misaligned selectors.
+        assert_eq!(std::mem::size_of::<AudioObjectPropertyAddress>(), 12);
+        assert_eq!(std::mem::align_of::<AudioObjectPropertyAddress>(), 4);
+
+        let a = AudioObjectPropertyAddress {
+            mSelector: 0x1111_1111,
+            mScope: 0x2222_2222,
+            mElement: 0x3333_3333,
+        };
+        let base = &a as *const _ as usize;
+        assert_eq!(&a.mSelector as *const _ as usize - base, 0);
+        assert_eq!(&a.mScope as *const _ as usize - base, 4);
+        assert_eq!(&a.mElement as *const _ as usize - base, 8);
     }
 }
