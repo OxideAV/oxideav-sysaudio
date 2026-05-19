@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(wasapi)* query real end-to-end output latency via `IAudioClock::GetPosition`
+  + cached `GetFrequency`. The worker publishes
+  `(frames_written - position_in_frames) / sample_rate` after each
+  `ReleaseBuffer`, giving callers the live total-pipeline delay (mix
+  engine + driver + device hardware) on Bluetooth, HDMI passthrough,
+  and remote-desktop sinks rather than the driver-side `GetStreamLatency`
+  estimate alone. Falls back to `GetStreamLatency + GetCurrentPadding`
+  when the driver shim refuses the `IAudioClock` service or
+  `GetFrequency` returns 0.
+
 ## [0.1.1](https://github.com/OxideAV/oxideav-sysaudio/compare/v0.1.0...v0.1.1) - 2026-04-24
 
 ### Added

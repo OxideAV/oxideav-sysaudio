@@ -60,7 +60,7 @@ network PulseAudio, HDMI passthrough, etc.):
 | --------- | ---------------------------------------------------------------------------------- | ---------------- |
 | PulseAudio| `pa_simple_get_latency` (end-to-end, server-side)                                  | Yes              |
 | ALSA      | `snd_pcm_delay` (driver queue depth)                                               | Partial          |
-| WASAPI    | `IAudioClient::GetStreamLatency` + live `GetCurrentPadding`                        | Yes              |
+| WASAPI    | Live `IAudioClock::GetPosition` vs. frames-written delta (end-to-end, includes the device hardware pipeline). Falls back to `GetStreamLatency` + live `GetCurrentPadding` if the driver shim doesn't implement `IAudioClock`. | Yes              |
 | CoreAudio | `num_buffers × period` + HAL (`kAudioDevicePropertyLatency` + buffer frame size + safety offset + stream latency) | Yes              |
 
 ## Features
