@@ -20,7 +20,7 @@ use std::time::Duration;
 use libloading::{Library, Symbol};
 
 use crate::backend::{Backend, Callback};
-use crate::format::{CallbackInfo, SampleFormat, StreamFormat, StreamRequest};
+use crate::format::{CallbackInfo, Device, SampleFormat, StreamFormat, StreamRequest};
 use crate::stream::StreamImpl;
 use crate::{Error, Result};
 
@@ -66,6 +66,21 @@ type Fn_snd_pcm_drop = unsafe extern "C" fn(pcm: *mut snd_pcm_t) -> c_int;
 type Fn_snd_pcm_pause = unsafe extern "C" fn(pcm: *mut snd_pcm_t, enable: c_int) -> c_int;
 type Fn_snd_pcm_delay = unsafe extern "C" fn(pcm: *mut snd_pcm_t, delayp: *mut c_long) -> c_int;
 type Fn_snd_strerror = unsafe extern "C" fn(errnum: c_int) -> *const c_char;
+
+// Device-enumeration ("name hint") API. `snd_device_name_hint` fills a
+// NULL-terminated array of opaque hint pointers; each pointer answers
+// `snd_device_name_get_hint(hint, key)` for keys "NAME" / "DESC" /
+// "IOID" with a freshly malloc'd C string (caller frees with the libc
+// `free`, which we reach via `snd_device_name_free_hint` for the array
+// and a stored libc `free` for the individual strings — but ALSA docs
+// say the per-string buffers are also freed by `free`; we keep them
+// short-lived and free each immediately). The whole array is released
+// by `snd_device_name_free_hint`.
+type Fn_snd_device_name_hint =
+    unsafe extern "C" fn(card: c_int, iface: *const c_char, hints: *mut *mut *mut c_void) -> c_int;
+type Fn_snd_device_name_get_hint =
+    unsafe extern "C" fn(hint: *const c_void, id: *const c_char) -> *mut c_char;
+type Fn_snd_device_name_free_hint = unsafe extern "C" fn(hints: *mut *mut c_void) -> c_int;
 
 type Fn_hw_params_malloc = unsafe extern "C" fn(ptr: *mut *mut snd_pcm_hw_params_t) -> c_int;
 type Fn_hw_params_free = unsafe extern "C" fn(obj: *mut snd_pcm_hw_params_t);
@@ -127,6 +142,18 @@ struct AlsaLib {
     snd_pcm_delay: Fn_snd_pcm_delay,
     snd_strerror: Fn_snd_strerror,
 
+    // Device-enumeration symbols + the libc `free` used to release the
+    // per-hint strings ALSA hands back. `free_fn` / the hint symbols are
+    // `Option` because they are not strictly required to open a stream;
+    // a libasound old enough to lack the name-hint API still plays
+    // audio, it just can't enumerate.
+    snd_device_name_hint: Option<Fn_snd_device_name_hint>,
+    snd_device_name_get_hint: Option<Fn_snd_device_name_get_hint>,
+    snd_device_name_free_hint: Option<Fn_snd_device_name_free_hint>,
+    free_fn: Option<unsafe extern "C" fn(*mut c_void)>,
+    // Keep the libc handle alive so `free_fn` stays mapped.
+    _libc: Option<Library>,
+
     hw_params_malloc: Fn_hw_params_malloc,
     hw_params_free: Fn_hw_params_free,
     hw_params_any: Fn_hw_params_any,
@@ -179,6 +206,29 @@ impl AlsaLib {
             let snd_pcm_delay = sym!(snd_pcm_delay, Fn_snd_pcm_delay);
             let snd_strerror = sym!(snd_strerror, Fn_snd_strerror);
 
+            // Optional name-hint symbols — present on every libasound
+            // since 1.0.14 (2007) but resolved defensively so a missing
+            // one degrades enumeration to empty rather than failing the
+            // whole load.
+            macro_rules! opt_sym {
+                ($name:ident, $ty:ty) => {{
+                    let r: std::result::Result<Symbol<$ty>, _> =
+                        lib.get(concat!(stringify!($name), "\0").as_bytes());
+                    r.ok().map(|s| *s)
+                }};
+            }
+            let snd_device_name_hint = opt_sym!(snd_device_name_hint, Fn_snd_device_name_hint);
+            let snd_device_name_get_hint =
+                opt_sym!(snd_device_name_get_hint, Fn_snd_device_name_get_hint);
+            let snd_device_name_free_hint =
+                opt_sym!(snd_device_name_free_hint, Fn_snd_device_name_free_hint);
+
+            // libc `free` for the malloc'd hint strings. Try the common
+            // sonames; if none load, enumeration leaks the per-hint
+            // strings (bounded — a one-shot enumeration), so we keep
+            // `free_fn` optional and never fail the load on its account.
+            let (libc, free_fn) = load_libc_free();
+
             let hw_params_malloc = sym!(snd_pcm_hw_params_malloc, Fn_hw_params_malloc);
             let hw_params_free = sym!(snd_pcm_hw_params_free, Fn_hw_params_free);
             let hw_params_any = sym!(snd_pcm_hw_params_any, Fn_hw_params_any);
@@ -213,6 +263,11 @@ impl AlsaLib {
                 snd_pcm_pause,
                 snd_pcm_delay,
                 snd_strerror,
+                snd_device_name_hint,
+                snd_device_name_get_hint,
+                snd_device_name_free_hint,
+                free_fn,
+                _libc: libc,
                 hw_params_malloc,
                 hw_params_free,
                 hw_params_any,
@@ -238,6 +293,116 @@ impl AlsaLib {
             }
         }
     }
+
+    /// Read one hint key (`"NAME"` / `"DESC"` / `"IOID"`) off a hint
+    /// pointer, copying it into an owned `String` and freeing the
+    /// libasound-malloc'd buffer. Returns `None` when the key is absent
+    /// (ALSA returns NULL — e.g. IOID is NULL for a duplex device).
+    unsafe fn get_hint(&self, hint: *const c_void, key: &CStr) -> Option<String> {
+        let get = self.snd_device_name_get_hint?;
+        let raw = get(hint, key.as_ptr());
+        if raw.is_null() {
+            return None;
+        }
+        let owned = CStr::from_ptr(raw).to_string_lossy().into_owned();
+        if let Some(free) = self.free_fn {
+            free(raw as *mut c_void);
+        }
+        Some(owned)
+    }
+
+    /// Enumerate playback PCM devices via the `snd_device_name_hint`
+    /// API. ALSA returns a NULL-terminated array of opaque hints, each
+    /// carrying NAME (the PCM string we pass to `snd_pcm_open`), DESC
+    /// (the friendly multi-line description) and IOID ("Input" /
+    /// "Output" / NULL=both). We keep hints whose IOID is Output or
+    /// unset, and tag the one named `"default"` as the system default.
+    fn enumerate(&self) -> Result<Vec<Device>> {
+        let hint_fn = self
+            .snd_device_name_hint
+            .ok_or(Error::NotImplemented("alsa"))?;
+        let free_hint_fn = self
+            .snd_device_name_free_hint
+            .ok_or(Error::NotImplemented("alsa"))?;
+
+        let iface = CString::new("pcm").unwrap();
+        let key_name = CString::new("NAME").unwrap();
+        let key_desc = CString::new("DESC").unwrap();
+        let key_ioid = CString::new("IOID").unwrap();
+
+        let mut out = Vec::new();
+        unsafe {
+            let mut hints: *mut *mut c_void = ptr::null_mut();
+            // card = -1 means "all cards".
+            let r = hint_fn(-1, iface.as_ptr(), &mut hints);
+            if r < 0 {
+                return Err(Error::Runtime {
+                    backend: "alsa",
+                    detail: format!("snd_device_name_hint: {}", self.strerror(r)),
+                });
+            }
+            if hints.is_null() {
+                return Ok(out);
+            }
+            let mut p = hints;
+            while !(*p).is_null() {
+                let hint = *p as *const c_void;
+                // Output filter: keep "Output" and NULL (duplex); drop
+                // "Input"-only capture endpoints, which would otherwise
+                // appear in this playback-oriented list.
+                let ioid = self.get_hint(hint, &key_ioid);
+                let is_output = match ioid.as_deref() {
+                    Some("Output") | None => true,
+                    Some(_) => false,
+                };
+                if is_output {
+                    if let Some(name) = self.get_hint(hint, &key_name) {
+                        // DESC's first line is the friendly card label;
+                        // subsequent lines are the long form. Take the
+                        // first line, fall back to NAME if DESC absent.
+                        let desc = self.get_hint(hint, &key_desc);
+                        let friendly = desc
+                            .as_deref()
+                            .and_then(|d| d.lines().next())
+                            .unwrap_or(&name)
+                            .to_string();
+                        let is_default = name == "default";
+                        out.push(Device {
+                            id: name,
+                            name: friendly,
+                            is_default,
+                        });
+                    }
+                }
+                p = p.add(1);
+            }
+            free_hint_fn(hints);
+        }
+        Ok(out)
+    }
+}
+
+/// Resolve libc's `free`, returning the owning `Library` (kept alive in
+/// `AlsaLib`) plus the function pointer. Best-effort: a `None` result
+/// just means the name-hint strings leak per enumeration call, which is
+/// bounded and never breaks playback.
+fn load_libc_free() -> (Option<Library>, Option<unsafe extern "C" fn(*mut c_void)>) {
+    // Glibc, musl, and the BSD-flavoured libc on some distros all expose
+    // `free` from one of these sonames. We deliberately do not depend on
+    // the `libc` crate — staying header- and link-free is this crate's
+    // whole premise.
+    const CANDIDATES: &[&str] = &["libc.so.6", "libc.so", "libc.musl-x86_64.so.1"];
+    for &name in CANDIDATES {
+        if let Ok(lib) = unsafe { Library::new(name) } {
+            let f: std::result::Result<Symbol<unsafe extern "C" fn(*mut c_void)>, _> =
+                unsafe { lib.get(b"free\0") };
+            if let Ok(sym) = f {
+                let ptr = *sym;
+                return (Some(lib), Some(ptr));
+            }
+        }
+    }
+    (None, None)
 }
 
 // Cached so we don't dlopen once per stream.
@@ -292,6 +457,10 @@ impl Backend for AlsaBackend {
     fn open(&self, req: StreamRequest, cb: Callback) -> Result<Box<dyn StreamImpl>> {
         let l = lib()?;
         unsafe { open_inner(l, req, cb) }
+    }
+
+    fn output_devices(&self) -> Result<Vec<Device>> {
+        lib()?.enumerate()
     }
 }
 

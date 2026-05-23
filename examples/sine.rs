@@ -20,6 +20,18 @@ fn main() {
         std::process::exit(1);
     }
 
+    println!("\nOutput devices (top driver):");
+    match probed[0].output_devices() {
+        Ok(devs) if !devs.is_empty() => {
+            for dev in devs {
+                let tag = if dev.is_default { " (default)" } else { "" };
+                println!("  - {}{tag}  [{}]", dev.name, dev.id);
+            }
+        }
+        Ok(_) => println!("  (backend lists no devices — default only)"),
+        Err(e) => println!("  (enumeration failed: {e})"),
+    }
+
     let sample_rate = 48_000u32;
     let channels = 2u16;
     let req = oxideav_sysaudio::StreamRequest::new(sample_rate, channels);

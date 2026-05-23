@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(api)* output-device enumeration: `Device { id, name, is_default }`,
+  `Driver::output_devices()` and the free `output_devices(driver)`. Each
+  backend lists its playback endpoints with the OS-friendly name and a
+  flag for the system default; backends that can only reach the default
+  (PulseAudio "simple", the PipeWire/OSS/ASIO stubs) return an empty list
+  rather than an error so callers can union across drivers.
+- *(alsa)* enumerate via `snd_device_name_hint("pcm")`, filtered to
+  `IOID=Output`/duplex; PCM `NAME` is the `id`, the first `DESC` line the
+  friendly name, `"default"` tagged as the system default. The malloc'd
+  hint strings are released through a runtime-resolved libc `free` (no
+  `libc` crate — same no-link-time-deps premise as the rest).
+- *(wasapi)* enumerate active render endpoints via
+  `IMMDeviceEnumerator::EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)`,
+  reading `PKEY_Device_FriendlyName` from each `IPropertyStore` and
+  tagging the `GetDefaultAudioEndpoint` match. New hand-rolled
+  `IMMDeviceCollection` / `IPropertyStore` vtables + a minimal
+  `PROPVARIANT`, freed with `PropVariantClear`.
+- *(coreaudio)* enumerate via HAL `kAudioHardwarePropertyDevices`, keeping
+  devices that expose output streams, labelling each with the
+  CFString-free `kAudioDevicePropertyDeviceName`, and tagging
+  `kAudioHardwarePropertyDefaultOutputDevice`.
 - *(wasapi)* query real end-to-end output latency via `IAudioClock::GetPosition`
   + cached `GetFrequency`. The worker publishes
   `(frames_written - position_in_frames) / sample_rate` after each

@@ -38,7 +38,7 @@ mod format;
 mod stream;
 
 pub use error::{Error, Result};
-pub use format::{CallbackInfo, SampleFormat, StreamFormat, StreamRequest};
+pub use format::{CallbackInfo, Device, SampleFormat, StreamFormat, StreamRequest};
 pub use stream::Stream;
 
 use backend::Backend;
@@ -57,6 +57,28 @@ impl Driver {
 
     pub fn description(&self) -> &'static str {
         self.inner.description()
+    }
+
+    /// Enumerate this backend's playback (output) devices, each tagged
+    /// with whether it is the system default. The list is in the
+    /// backend's natural order; exactly one entry has
+    /// [`Device::is_default`] set when the backend can identify a
+    /// default (and the list is non-empty).
+    ///
+    /// Backends that can only reach the default device — the PulseAudio
+    /// "simple" API, and the not-yet-wired stubs (PipeWire, OSS, ASIO) —
+    /// return an empty list rather than an error, so a caller can union
+    /// device lists across every probed driver without per-backend
+    /// special-casing. A genuine failure (library present but the
+    /// enumeration call errored) surfaces as an [`Err`].
+    pub fn output_devices(&self) -> Result<Vec<Device>> {
+        match self.inner.output_devices() {
+            Ok(v) => Ok(v),
+            // A backend that doesn't implement enumeration is reported
+            // as "no devices known", not an error — see the trait doc.
+            Err(Error::NotImplemented(_)) => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -143,6 +165,13 @@ where
     open(d, req, cb)
 }
 
+/// Enumerate the playback (output) devices visible on `driver`. Thin
+/// wrapper over [`Driver::output_devices`]; see that method for the
+/// empty-list-vs-error contract.
+pub fn output_devices(driver: Driver) -> Result<Vec<Device>> {
+    driver.output_devices()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,6 +188,47 @@ mod tests {
     fn driver_by_name_roundtrip() {
         for d in drivers() {
             assert_eq!(driver_by_name(d.name()).map(|x| x.name()), Some(d.name()));
+        }
+    }
+
+    #[test]
+    fn output_devices_never_errors_with_not_implemented() {
+        // The public layer maps a backend's `NotImplemented` into an
+        // empty list, so iterating every compiled-in driver must never
+        // surface that variant — only a genuine runtime failure (which
+        // won't happen in CI's headless environment where no library
+        // loads) would be an `Err`. We therefore accept either `Ok`
+        // (real or empty list) or a non-`NotImplemented` `Err`, but the
+        // common headless path is `Ok(vec![])` per backend.
+        for d in drivers() {
+            match d.output_devices() {
+                Ok(_) => {}
+                Err(Error::NotImplemented(b)) => {
+                    panic!("output_devices leaked NotImplemented for {b}")
+                }
+                // Library-not-present / device-open failures are fine in
+                // a headless CI box without a sound server.
+                Err(_) => {}
+            }
+        }
+    }
+
+    #[test]
+    fn at_most_one_default_per_driver() {
+        // Whatever a backend returns, the list must never claim two
+        // defaults. (A headless CI box typically returns an empty list,
+        // which trivially satisfies this; the invariant matters on a
+        // real machine and is cheap to assert unconditionally.)
+        for d in drivers() {
+            if let Ok(devs) = d.output_devices() {
+                let defaults = devs.iter().filter(|x| x.is_default).count();
+                assert!(
+                    defaults <= 1,
+                    "{} reported {} default devices",
+                    d.name(),
+                    defaults
+                );
+            }
         }
     }
 }

@@ -34,7 +34,7 @@ use std::time::Duration;
 use libloading::{Library, Symbol};
 
 use crate::backend::{Backend, Callback};
-use crate::format::{CallbackInfo, SampleFormat, StreamFormat, StreamRequest};
+use crate::format::{CallbackInfo, Device, SampleFormat, StreamFormat, StreamRequest};
 use crate::stream::StreamImpl;
 use crate::{Error, Result};
 
@@ -133,6 +133,58 @@ const KSDATAFORMAT_SUBTYPE_PCM: GUID = guid(
     [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71],
 );
 
+// PROPERTYKEY for the endpoint's friendly name, published in
+// functiondiscoverykeys_devpkey.h as PKEY_Device_FriendlyName =
+// {a45c254e-df1c-4efd-8020-67d146a850e0}, PID 14. The PROPVARIANT it
+// yields is VT_LPWSTR.
+const PKEY_Device_FriendlyName: PROPERTYKEY = PROPERTYKEY {
+    fmtid: guid(
+        0xA45C_254E,
+        0xDF1C,
+        0x4EFD,
+        [0x80, 0x20, 0x67, 0xD1, 0x46, 0xA8, 0x50, 0xE0],
+    ),
+    pid: 14,
+};
+
+// IMMDeviceEnumerator::EnumAudioEndpoints flow + state-mask args.
+const eRender: c_int = 0;
+const eConsole: c_int = 0;
+const DEVICE_STATE_ACTIVE: DWORD = 0x0000_0001;
+// IPropertyStore::Open access mode: STGM_READ.
+const STGM_READ: DWORD = 0x0000_0000;
+// PROPVARIANT discriminant for a wide-string value.
+const VT_LPWSTR: u16 = 31;
+
+/// `PROPERTYKEY` — a GUID plus a property id. Layout matches
+/// `<wtypes.h>` (16-byte GUID then a 4-byte DWORD, naturally aligned).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PROPERTYKEY {
+    fmtid: GUID,
+    pid: DWORD,
+}
+
+/// Minimal `PROPVARIANT`. The real union is large; we only ever read the
+/// `VT_LPWSTR` arm, so we model the header (`vt` + three padding `u16`
+/// fields the SDK reserves) followed by a pointer-sized value slot and
+/// enough tail to match the documented 16-byte (32-bit) / 24-byte
+/// (64-bit) total. We never construct one — `IPropertyStore::GetValue`
+/// fills it and `PropVariantClear` frees it; we just peek `vt` and the
+/// `pwsz` pointer.
+#[repr(C)]
+struct PROPVARIANT {
+    vt: u16,
+    _reserved1: u16,
+    _reserved2: u16,
+    _reserved3: u16,
+    // Union slot — for VT_LPWSTR this is the `LPWSTR pwszVal`. The union
+    // is two pointers wide on the SDK; the second half is unused for the
+    // arms we read.
+    val: *mut u16,
+    _val_tail: *mut c_void,
+}
+
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct WAVEFORMATEX {
@@ -213,6 +265,39 @@ struct IMMDeviceVtbl {
     ) -> HRESULT,
     GetId: unsafe extern "system" fn(this: *mut c_void, ppstrId: *mut *mut u16) -> HRESULT,
     GetState: unsafe extern "system" fn(this: *mut c_void, pdwState: *mut DWORD) -> HRESULT,
+}
+
+#[repr(C)]
+struct IMMDeviceCollectionVtbl {
+    parent: IUnknownVtbl,
+    GetCount: unsafe extern "system" fn(this: *mut c_void, pcDevices: *mut u32) -> HRESULT,
+    Item: unsafe extern "system" fn(
+        this: *mut c_void,
+        nDevice: u32,
+        ppDevice: *mut *mut c_void,
+    ) -> HRESULT,
+}
+
+#[repr(C)]
+struct IPropertyStoreVtbl {
+    parent: IUnknownVtbl,
+    GetCount: unsafe extern "system" fn(this: *mut c_void, cProps: *mut DWORD) -> HRESULT,
+    GetAt: unsafe extern "system" fn(
+        this: *mut c_void,
+        iProp: DWORD,
+        pkey: *mut PROPERTYKEY,
+    ) -> HRESULT,
+    GetValue: unsafe extern "system" fn(
+        this: *mut c_void,
+        key: *const PROPERTYKEY,
+        pv: *mut PROPVARIANT,
+    ) -> HRESULT,
+    SetValue: unsafe extern "system" fn(
+        this: *mut c_void,
+        key: *const PROPERTYKEY,
+        propvar: *const PROPVARIANT,
+    ) -> HRESULT,
+    Commit: unsafe extern "system" fn(this: *mut c_void) -> HRESULT,
 }
 
 #[repr(C)]
@@ -316,6 +401,7 @@ type Fn_CoCreateInstance = unsafe extern "system" fn(
     ppv: *mut *mut c_void,
 ) -> HRESULT;
 type Fn_CoTaskMemFree = unsafe extern "system" fn(pv: *mut c_void);
+type Fn_PropVariantClear = unsafe extern "system" fn(pvar: *mut PROPVARIANT) -> HRESULT;
 
 type Fn_CreateEventA = unsafe extern "system" fn(
     lpEventAttributes: *mut c_void,
@@ -335,6 +421,7 @@ struct WinLibs {
     CoUninitialize: Fn_CoUninitialize,
     CoCreateInstance: Fn_CoCreateInstance,
     CoTaskMemFree: Fn_CoTaskMemFree,
+    PropVariantClear: Fn_PropVariantClear,
     CreateEventA: Fn_CreateEventA,
     CloseHandle: Fn_CloseHandle,
     WaitForSingleObject: Fn_WaitForSingleObject,
@@ -375,6 +462,7 @@ impl WinLibs {
                 CoUninitialize: sym!(ole32, "CoUninitialize", Fn_CoUninitialize),
                 CoCreateInstance: sym!(ole32, "CoCreateInstance", Fn_CoCreateInstance),
                 CoTaskMemFree: sym!(ole32, "CoTaskMemFree", Fn_CoTaskMemFree),
+                PropVariantClear: sym!(ole32, "PropVariantClear", Fn_PropVariantClear),
                 CreateEventA: sym!(kernel32, "CreateEventA", Fn_CreateEventA),
                 CloseHandle: sym!(kernel32, "CloseHandle", Fn_CloseHandle),
                 WaitForSingleObject: sym!(kernel32, "WaitForSingleObject", Fn_WaitForSingleObject),
@@ -443,6 +531,158 @@ impl Backend for WasapiBackend {
         let l = lib()?;
         unsafe { open_inner(l, req, cb) }
     }
+
+    fn output_devices(&self) -> Result<Vec<Device>> {
+        let l = lib()?;
+        unsafe { enumerate_output_devices(&l) }
+    }
+}
+
+/// Copy a NUL-terminated UTF-16 (`LPWSTR`) into an owned `String`.
+/// Stops at the first `0` code unit or after a generous cap so a missing
+/// terminator can't run off the end of mapped memory.
+unsafe fn wide_to_string(p: *const u16) -> String {
+    if p.is_null() {
+        return String::new();
+    }
+    let mut len = 0usize;
+    while *p.add(len) != 0 && len < 8192 {
+        len += 1;
+    }
+    let slice = std::slice::from_raw_parts(p, len);
+    String::from_utf16_lossy(slice)
+}
+
+/// Read the friendly name off an `IMMDevice` via its property store.
+/// Returns an empty string if the store, the value, or the VT type isn't
+/// what we expect — the caller still lists the device, just unlabeled.
+unsafe fn device_friendly_name(l: &WinLibs, device: *mut c_void) -> String {
+    let device_vtbl = *(device as *mut *const IMMDeviceVtbl);
+    let mut store: *mut c_void = ptr::null_mut();
+    let hr = ((*device_vtbl).OpenPropertyStore)(device, STGM_READ, &mut store);
+    if hr != S_OK || store.is_null() {
+        return String::new();
+    }
+    let store_vtbl = *(store as *mut *const IPropertyStoreVtbl);
+    let mut pv = PROPVARIANT {
+        vt: 0,
+        _reserved1: 0,
+        _reserved2: 0,
+        _reserved3: 0,
+        val: ptr::null_mut(),
+        _val_tail: ptr::null_mut(),
+    };
+    let hr = ((*store_vtbl).GetValue)(store, &PKEY_Device_FriendlyName, &mut pv);
+    let name = if hr == S_OK && pv.vt == VT_LPWSTR {
+        wide_to_string(pv.val)
+    } else {
+        String::new()
+    };
+    // Free the PROPVARIANT's owned string regardless of VT (no-op on the
+    // empty/error case) then release the store.
+    let _ = (l.PropVariantClear)(&mut pv);
+    com_release(store);
+    name
+}
+
+/// Endpoint id string (`IMMDevice::GetId`, CoTaskMem-allocated LPWSTR)
+/// copied into an owned `String`; frees the COM allocation. Empty on
+/// failure.
+unsafe fn device_id_string(l: &WinLibs, device: *mut c_void) -> String {
+    let device_vtbl = *(device as *mut *const IMMDeviceVtbl);
+    let mut pid: *mut u16 = ptr::null_mut();
+    let hr = ((*device_vtbl).GetId)(device, &mut pid);
+    if hr != S_OK || pid.is_null() {
+        return String::new();
+    }
+    let s = wide_to_string(pid);
+    (l.CoTaskMemFree)(pid as *mut c_void);
+    s
+}
+
+/// Enumerate active render (output) endpoints, labeling each with its
+/// friendly name and tagging the default. Reuses the same
+/// `IMMDeviceEnumerator` the open path uses.
+unsafe fn enumerate_output_devices(l: &WinLibs) -> Result<Vec<Device>> {
+    co_init(l);
+
+    let mut enumer: *mut c_void = ptr::null_mut();
+    let hr = (l.CoCreateInstance)(
+        &CLSID_MMDeviceEnumerator,
+        ptr::null_mut(),
+        CLSCTX_ALL,
+        &IID_IMMDeviceEnumerator,
+        &mut enumer,
+    );
+    if hr != S_OK || enumer.is_null() {
+        (l.CoUninitialize)();
+        return Err(Error::Runtime {
+            backend: "wasapi",
+            detail: format!("CoCreateInstance(MMDeviceEnumerator) HRESULT=0x{hr:08X}"),
+        });
+    }
+    let enumer_vtbl = *(enumer as *mut *const IMMDeviceEnumeratorVtbl);
+
+    // Default endpoint id (best-effort) so we can tag the matching entry.
+    let mut default_dev: *mut c_void = ptr::null_mut();
+    let default_id = {
+        let hr =
+            ((*enumer_vtbl).GetDefaultAudioEndpoint)(enumer, eRender, eConsole, &mut default_dev);
+        if hr == S_OK && !default_dev.is_null() {
+            let id = device_id_string(l, default_dev);
+            com_release(default_dev);
+            id
+        } else {
+            String::new()
+        }
+    };
+
+    let mut collection: *mut c_void = ptr::null_mut();
+    let hr =
+        ((*enumer_vtbl).EnumAudioEndpoints)(enumer, eRender, DEVICE_STATE_ACTIVE, &mut collection);
+    if hr != S_OK || collection.is_null() {
+        com_release(enumer);
+        (l.CoUninitialize)();
+        return Err(Error::Runtime {
+            backend: "wasapi",
+            detail: format!("EnumAudioEndpoints HRESULT=0x{hr:08X}"),
+        });
+    }
+    com_release(enumer);
+
+    let coll_vtbl = *(collection as *mut *const IMMDeviceCollectionVtbl);
+    let mut count: u32 = 0;
+    let hr = ((*coll_vtbl).GetCount)(collection, &mut count);
+    if hr != S_OK {
+        com_release(collection);
+        (l.CoUninitialize)();
+        return Err(Error::Runtime {
+            backend: "wasapi",
+            detail: format!("IMMDeviceCollection::GetCount HRESULT=0x{hr:08X}"),
+        });
+    }
+
+    let mut out = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let mut dev: *mut c_void = ptr::null_mut();
+        let hr = ((*coll_vtbl).Item)(collection, i, &mut dev);
+        if hr != S_OK || dev.is_null() {
+            continue;
+        }
+        let id = device_id_string(l, dev);
+        let name = device_friendly_name(l, dev);
+        com_release(dev);
+        let is_default = !default_id.is_empty() && id == default_id;
+        out.push(Device {
+            id,
+            name,
+            is_default,
+        });
+    }
+
+    com_release(collection);
+    (l.CoUninitialize)();
+    Ok(out)
 }
 
 /// Resolve IMMDeviceEnumerator → default endpoint → IAudioClient and
@@ -1025,6 +1265,44 @@ mod tests {
         // interfaces in this file use. A drift here would silently
         // mis-identify the requested interface.
         assert_eq!(std::mem::size_of::<GUID>(), 16);
+    }
+
+    #[test]
+    fn property_key_and_propvariant_layout() {
+        // PROPERTYKEY is a 16-byte GUID followed by a DWORD; with
+        // natural alignment that's 20 bytes, 4-byte aligned. A drift
+        // here would feed IPropertyStore::GetValue a misaligned key.
+        assert_eq!(std::mem::size_of::<PROPERTYKEY>(), 20);
+        assert_eq!(std::mem::align_of::<PROPERTYKEY>(), 4);
+
+        // The friendly-name key must match the value published in
+        // functiondiscoverykeys_devpkey.h, PID 14.
+        assert_eq!(PKEY_Device_FriendlyName.pid, 14);
+        assert_eq!(PKEY_Device_FriendlyName.fmtid.data1, 0xA45C_254E);
+
+        // Our PROPVARIANT models the 8-byte header (vt + 3 reserved
+        // u16) then a two-pointer union slot. On a 64-bit target that's
+        // 8 + 16 = 24 bytes, matching the SDK PROPVARIANT we read into.
+        // The `vt` field must sit at offset 0 so GetValue's discriminant
+        // lands where we peek it.
+        let pv = PROPVARIANT {
+            vt: VT_LPWSTR,
+            _reserved1: 0,
+            _reserved2: 0,
+            _reserved3: 0,
+            val: ptr::null_mut(),
+            _val_tail: ptr::null_mut(),
+        };
+        assert_eq!(&pv.vt as *const _ as usize, &pv as *const _ as usize);
+    }
+
+    #[test]
+    fn collection_and_propstore_vtbl_layout() {
+        let ptr_size = std::mem::size_of::<usize>();
+        // IUnknown's 3 slots + GetCount + Item = 5.
+        assert_eq!(std::mem::size_of::<IMMDeviceCollectionVtbl>(), 5 * ptr_size);
+        // IUnknown's 3 + GetCount/GetAt/GetValue/SetValue/Commit = 8.
+        assert_eq!(std::mem::size_of::<IPropertyStoreVtbl>(), 8 * ptr_size);
     }
 
     #[test]

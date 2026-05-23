@@ -52,3 +52,30 @@ pub struct CallbackInfo {
     /// cheap audio master clock.
     pub frames_played: u64,
 }
+
+/// A single output device discovered by a backend's enumeration.
+///
+/// Returned by [`crate::Driver::output_devices`] /
+/// [`crate::output_devices`]. The `id` is the backend-native opaque
+/// identifier (an ALSA PCM name like `"plughw:CARD=PCH,DEV=0"`, a WASAPI
+/// endpoint id wstring rendered as UTF-8, a CoreAudio numeric
+/// `AudioDeviceID` formatted as decimal) and is stable enough to log or
+/// match against; `name` is the human-friendly label the OS shows in its
+/// sound settings. Exactly one device in a non-empty list has
+/// `is_default == true` — the one [`crate::default_driver`] / `open()`
+/// would use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Device {
+    /// Backend-native opaque identifier. Format differs per backend; do
+    /// not parse it — treat it as an opaque token for logging or
+    /// equality comparison against another `Device` from the same
+    /// backend.
+    pub id: String,
+    /// Human-readable name as shown in the OS sound settings (e.g.
+    /// "MacBook Pro Speakers", "Realtek HD Audio Output", "USB
+    /// Headset"). May be empty if the OS exposes no friendly label.
+    pub name: String,
+    /// `true` for the system's current default output endpoint — the
+    /// device a plain `open_default()` plays through.
+    pub is_default: bool,
+}

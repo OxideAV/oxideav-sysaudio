@@ -37,7 +37,7 @@ use std::time::Duration;
 use libloading::{Library, Symbol};
 
 use crate::backend::{Backend, Callback};
-use crate::format::{CallbackInfo, SampleFormat, StreamFormat, StreamRequest};
+use crate::format::{CallbackInfo, Device, SampleFormat, StreamFormat, StreamRequest};
 use crate::stream::StreamImpl;
 use crate::{Error, Result};
 
@@ -235,6 +235,18 @@ const fn four_cc(b: &[u8; 4]) -> u32 {
 // kAudioObjectSystemObject is the documented singleton ID 1.
 const kAudioObjectSystemObject: u32 = 1;
 const kAudioHardwarePropertyDefaultOutputDevice: u32 = four_cc(b"dOut");
+// All audio devices known to the HAL (output + input + aggregate).
+const kAudioHardwarePropertyDevices: u32 = four_cc(b"dev#");
+// Per-device friendly name. The CFString-typed
+// `kAudioObjectPropertyName` would drag in CoreFoundation, which this
+// crate deliberately avoids; the deprecated `kAudioDevicePropertyDeviceName`
+// returns a plain NUL-terminated C string buffer instead, so we use it
+// for the label. Still present and populated on every shipping macOS.
+const kAudioDevicePropertyDeviceName: u32 = four_cc(b"name");
+// Per-device UID (CFStringRef) is the stable cross-boot id; decoding it
+// needs CoreFoundation, so we expose the numeric AudioDeviceID as the
+// `Device::id` token instead — opaque and stable within a boot session,
+// which is all the contract promises.
 
 // Scope/element selectors on the HAL object tree.
 const kAudioObjectPropertyScopeGlobal: u32 = four_cc(b"glob");
@@ -485,6 +497,143 @@ unsafe fn query_hardware_latency_frames(ca: &CaLib) -> Option<u32> {
     )
 }
 
+/// All device IDs the HAL knows about (`kAudioHardwarePropertyDevices`
+/// on the system object). Same two-step size-then-data idiom as
+/// `hal_first_output_stream`.
+unsafe fn hal_all_devices(ca: &CaLib) -> Vec<AudioObjectID> {
+    let addr = AudioObjectPropertyAddress {
+        mSelector: kAudioHardwarePropertyDevices,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let mut size: u32 = 0;
+    let r = (ca.AudioObjectGetPropertyData)(
+        kAudioObjectSystemObject,
+        &addr,
+        0,
+        ptr::null(),
+        &mut size,
+        ptr::null_mut(),
+    );
+    if r != 0 || size < std::mem::size_of::<AudioObjectID>() as u32 {
+        return Vec::new();
+    }
+    let count = size as usize / std::mem::size_of::<AudioObjectID>();
+    let mut buf: Vec<AudioObjectID> = vec![0; count];
+    let r = (ca.AudioObjectGetPropertyData)(
+        kAudioObjectSystemObject,
+        &addr,
+        0,
+        ptr::null(),
+        &mut size,
+        buf.as_mut_ptr() as *mut c_void,
+    );
+    if r != 0 {
+        return Vec::new();
+    }
+    buf.retain(|&id| id != 0);
+    buf
+}
+
+/// `true` when `device` has at least one stream on the output scope —
+/// i.e. it can play audio. Pure-input devices (built-in mic, USB
+/// capture) report zero output streams and are dropped from the
+/// playback list.
+unsafe fn hal_is_output_device(ca: &CaLib, device: AudioObjectID) -> bool {
+    let addr = AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyStreams,
+        mScope: kAudioObjectPropertyScopeOutput,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let mut size: u32 = 0;
+    let r =
+        (ca.AudioObjectGetPropertyData)(device, &addr, 0, ptr::null(), &mut size, ptr::null_mut());
+    r == 0 && size >= std::mem::size_of::<AudioObjectID>() as u32
+}
+
+/// Friendly name for `device` via the deprecated-but-CFString-free
+/// `kAudioDevicePropertyDeviceName`, which writes a NUL-terminated C
+/// string into a caller buffer. Returns an empty string if the HAL
+/// reports no name.
+unsafe fn hal_device_name(ca: &CaLib, device: AudioObjectID) -> String {
+    let addr = AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyDeviceName,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let mut size: u32 = 0;
+    let r =
+        (ca.AudioObjectGetPropertyData)(device, &addr, 0, ptr::null(), &mut size, ptr::null_mut());
+    if r != 0 || size == 0 {
+        return String::new();
+    }
+    // Cap the buffer defensively — a sane device name is well under 1 KiB.
+    let cap = (size as usize).min(4096);
+    let mut buf: Vec<u8> = vec![0u8; cap];
+    let mut got = cap as u32;
+    let r = (ca.AudioObjectGetPropertyData)(
+        device,
+        &addr,
+        0,
+        ptr::null(),
+        &mut got,
+        buf.as_mut_ptr() as *mut c_void,
+    );
+    if r != 0 {
+        return String::new();
+    }
+    // The buffer is a C string; trim at the first NUL.
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+/// Numeric AudioDeviceID of the current default output, or 0 if the
+/// query fails.
+unsafe fn hal_default_output_device(ca: &CaLib) -> AudioObjectID {
+    let addr = AudioObjectPropertyAddress {
+        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let mut device: AudioObjectID = 0;
+    let mut size: u32 = std::mem::size_of::<AudioObjectID>() as u32;
+    let r = (ca.AudioObjectGetPropertyData)(
+        kAudioObjectSystemObject,
+        &addr,
+        0,
+        ptr::null(),
+        &mut size,
+        &mut device as *mut AudioObjectID as *mut c_void,
+    );
+    if r != 0 {
+        0
+    } else {
+        device
+    }
+}
+
+/// Enumerate output-capable devices via the HAL. Walks
+/// `kAudioHardwarePropertyDevices`, keeps the ones with output streams,
+/// labels each with its name, and tags the system default.
+fn enumerate_output_devices() -> Result<Vec<Device>> {
+    let ca = ca_lib().ok_or(Error::NotImplemented("coreaudio"))?;
+    let mut out = Vec::new();
+    unsafe {
+        let default = hal_default_output_device(&ca);
+        for id in hal_all_devices(&ca) {
+            if !hal_is_output_device(&ca, id) {
+                continue;
+            }
+            out.push(Device {
+                id: id.to_string(),
+                name: hal_device_name(&ca, id),
+                is_default: id == default && default != 0,
+            });
+        }
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Backend
 // ---------------------------------------------------------------------------
@@ -530,6 +679,10 @@ impl Backend for CoreAudioBackend {
     fn open(&self, req: StreamRequest, cb: Callback) -> Result<Box<dyn StreamImpl>> {
         let l = lib()?;
         unsafe { open_inner(l, req, cb) }
+    }
+
+    fn output_devices(&self) -> Result<Vec<Device>> {
+        enumerate_output_devices()
     }
 }
 
@@ -841,6 +994,9 @@ mod tests {
         );
         assert_eq!(kAudioDevicePropertyStreams, u32::from_be_bytes(*b"stm#"));
         assert_eq!(kAudioStreamPropertyLatency, u32::from_be_bytes(*b"ltnc"));
+        // Device-enumeration selectors.
+        assert_eq!(kAudioHardwarePropertyDevices, u32::from_be_bytes(*b"dev#"));
+        assert_eq!(kAudioDevicePropertyDeviceName, u32::from_be_bytes(*b"name"));
         // Cross-check against the existing `kAudioFormatLinearPCM`
         // literal to make sure our `four_cc` helper matches the
         // hand-written form used elsewhere in this file.
