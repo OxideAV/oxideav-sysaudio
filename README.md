@@ -129,7 +129,7 @@ for dev in d.output_devices()? {
 | ALSA      | `id` is the PCM name; passed straight to `snd_pcm_open`.                        |
 | PulseAudio| `id` is a sink name; passed as the `dev` arg of `pa_simple_new`.                |
 | WASAPI    | `id` is the LPWSTR endpoint id; resolved via `IMMDeviceEnumerator::GetDevice`.  |
-| CoreAudio | Not wired — needs the CFString device UID; `Err(UnsupportedFormat)`. (follow-up) |
+| CoreAudio | `id` is the decimal `AudioDeviceID`; HAL `kAudioDevicePropertyDeviceUID` yields the CFString, then `AudioQueueSetProperty(kAudioQueueProperty_CurrentDevice, &cfstr)` binds the queue. `latency()` follows the bound device. |
 
 Leaving `device` as `None` (the default constructor) opens the system
 default endpoint, matching the historical `open()` / `open_default()`
@@ -141,12 +141,6 @@ behaviour.
 - **PulseAudio device enumeration.** The "simple" API exposes no sink
   introspection; it returns an empty list. The full async
   `pa_context_get_sink_info_list` path is a follow-up.
-- **CoreAudio per-device routing.** Enumeration works, but binding an
-  AudioQueue to a specific enumerated `AudioDeviceID` needs the device
-  UID (CFStringRef) and CoreFoundation glue we have not added yet. A
-  caller that passes a `device` on macOS gets a clean
-  `Err(UnsupportedFormat)` rather than a silent fallback to the
-  default endpoint.
 - **Sample formats other than f32** on the public callback surface.
   Backends convert internally where the hardware insists on S16 or
   similar.

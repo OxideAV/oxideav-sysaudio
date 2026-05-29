@@ -39,12 +39,13 @@ pub struct StreamRequest {
     ///   typically obtains the id out-of-band via `pactl list sinks short`.
     /// - **WASAPI**: resolved through `IMMDeviceEnumerator::GetDevice`
     ///   against the LPWSTR endpoint id `output_devices()` returned.
-    /// - **CoreAudio**: not yet wired — see crate README "Non-goals". The
-    ///   `id` we expose is the numeric `AudioDeviceID`, but routing an
-    ///   AudioQueue at a specific device requires the device UID
-    ///   (CFStringRef) and CoreFoundation symbol resolution we have not
-    ///   added yet. Setting `device` on macOS currently returns
-    ///   [`crate::Error::UnsupportedFormat`].
+    /// - **CoreAudio**: the decimal `AudioDeviceID` from `Device::id` is
+    ///   resolved to its CFString UID via the HAL property
+    ///   `kAudioDevicePropertyDeviceUID`, then handed to
+    ///   `AudioQueueSetProperty(kAudioQueueProperty_CurrentDevice, &cfstr)`
+    ///   before the queue starts. `latency()` follows the bound device.
+    ///   Fabricated / cross-backend strings that don't parse as a decimal
+    ///   id surface as [`crate::Error::UnsupportedFormat`].
     ///
     /// Passing an id that the backend can't resolve surfaces as a normal
     /// [`crate::Error::DeviceOpen`].

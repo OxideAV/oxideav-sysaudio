@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(coreaudio)* per-device routing now wired. The numeric `AudioDeviceID`
+  exposed in `Device::id` is resolved through the HAL property
+  `kAudioDevicePropertyDeviceUID` to a CFStringRef, then handed to
+  `AudioQueueSetProperty(queue, kAudioQueueProperty_CurrentDevice, &cfstr)`
+  before `AudioQueueStart`. CoreFoundation is `dlopen`'d at runtime
+  through a new minimal `CfLib` (only `CFRelease`) so the no-link-time-deps
+  invariant still holds — no `objc`, no `core-foundation` crate, the
+  produced binary lists nothing CF-related in its load commands. The HAL
+  latency query (`latency()`) now follows the bound device when one was
+  set, so the figure stays correct on USB DACs / Bluetooth headphones
+  routed via `open_on`. Non-numeric `Device::id` strings (callers
+  fabricating ids, or routing strings from another backend) surface as
+  `Error::UnsupportedFormat` rather than silently falling back to the
+  system default. Closes the previous "CoreAudio per-device routing"
+  non-goal.
 - *(api)* per-device opening: `StreamRequest::with_device(id)` (and the
   underlying `StreamRequest::device: Option<String>`) plus the free
   `open_on(driver, &device, req, cb)` convenience. Closes the previous
@@ -16,10 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Device::id` straight back into `open()`. ALSA routes the id as the
   PCM name to `snd_pcm_open`; PulseAudio passes it as the `dev` arg of
   `pa_simple_new`; WASAPI resolves it through
-  `IMMDeviceEnumerator::GetDevice` (LPWSTR). CoreAudio still requires a
-  CFString device UID for AudioQueue routing, so `device.is_some()` on
-  macOS returns `Err(UnsupportedFormat)` rather than silently opening
-  the default endpoint. `StreamRequest` is now `Clone` (no longer
+  `IMMDeviceEnumerator::GetDevice` (LPWSTR); CoreAudio resolves the
+  numeric `AudioDeviceID` to a CFString UID via the HAL and binds the
+  AudioQueue with `kAudioQueueProperty_CurrentDevice` (see the
+  *(coreaudio)* entry above). `StreamRequest` is now `Clone` (no longer
   `Copy`) so it can carry an owned `String` id.
 - *(api)* output-device enumeration: `Device { id, name, is_default }`,
   `Driver::output_devices()` and the free `output_devices(driver)`. Each

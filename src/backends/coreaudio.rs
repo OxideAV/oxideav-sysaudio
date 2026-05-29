@@ -125,6 +125,17 @@ type Fn_AudioQueuePause = unsafe extern "C" fn(inAQ: AudioQueueRef) -> OSStatus;
 
 type Fn_AudioQueueDispose = unsafe extern "C" fn(inAQ: AudioQueueRef, inImmediate: u8) -> OSStatus;
 
+/// `AudioQueueSetProperty(inAQ, inID, inData, inDataSize)`. Used to bind
+/// the queue to a specific output device via
+/// `kAudioQueueProperty_CurrentDevice` whose value is a `CFStringRef`
+/// device UID — see `AudioQueue.h` line 271 in the macOS 26 SDK.
+type Fn_AudioQueueSetProperty = unsafe extern "C" fn(
+    inAQ: AudioQueueRef,
+    inID: u32,
+    inData: *const c_void,
+    inDataSize: u32,
+) -> OSStatus;
+
 struct AtLib {
     _lib: Library,
     AudioQueueNewOutput: Fn_AudioQueueNewOutput,
@@ -134,6 +145,7 @@ struct AtLib {
     AudioQueueStop: Fn_AudioQueueStop,
     AudioQueuePause: Fn_AudioQueuePause,
     AudioQueueDispose: Fn_AudioQueueDispose,
+    AudioQueueSetProperty: Fn_AudioQueueSetProperty,
 }
 
 unsafe impl Send for AtLib {}
@@ -189,6 +201,7 @@ impl AtLib {
                 AudioQueueStop: sym!(AudioQueueStop, Fn_AudioQueueStop),
                 AudioQueuePause: sym!(AudioQueuePause, Fn_AudioQueuePause),
                 AudioQueueDispose: sym!(AudioQueueDispose, Fn_AudioQueueDispose),
+                AudioQueueSetProperty: sym!(AudioQueueSetProperty, Fn_AudioQueueSetProperty),
                 _lib: lib,
             }))
         }
@@ -262,6 +275,19 @@ const kAudioDevicePropertySafetyOffset: u32 = four_cc(b"saft");
 // Stream enumeration + per-stream latency (scope = output).
 const kAudioDevicePropertyStreams: u32 = four_cc(b"stm#");
 const kAudioStreamPropertyLatency: u32 = four_cc(b"ltnc");
+// Persistent cross-boot device identifier (CFStringRef). AudioHardwareBase.h
+// l. 734 in the macOS 26 SDK documents this as the `'uid '` selector whose
+// value is a CFString — the exact shape `kAudioQueueProperty_CurrentDevice`
+// wants on the AudioQueue side.
+const kAudioDevicePropertyDeviceUID: u32 = four_cc(b"uid ");
+
+// AudioQueue side: the property whose value is the CFStringRef device UID we
+// just queried out of the HAL. `AudioQueue.h` l. 271 in the macOS 26 SDK
+// publishes the selector as the FourCC `'aqcd'` (value type CFStringRef);
+// `AudioQueueSetProperty(queue, kAudioQueueProperty_CurrentDevice, &cfstr,
+// sizeof(CFStringRef))` reroutes the queue to that device. Called before
+// `AudioQueueStart` so the queue never plays through the wrong endpoint.
+const kAudioQueueProperty_CurrentDevice: u32 = four_cc(b"aqcd");
 
 /// `AudioObjectGetPropertyData(inObjectID, inAddress, 0, NULL,
 /// ioDataSize, outData)` — the getter every HAL query funnels
@@ -330,6 +356,110 @@ fn ca_lib() -> Option<Arc<CaLib>> {
     loaded
 }
 
+// ---------------------------------------------------------------------------
+// CoreFoundation.framework — minimal surface for CFStringRef handling.
+// ---------------------------------------------------------------------------
+//
+// `kAudioQueueProperty_CurrentDevice` wants a CFStringRef (the device UID)
+// and `kAudioDevicePropertyDeviceUID` hands one back, the HAL retaining
+// ownership over a CFString it allocated. We never need to read the string
+// content — the CFStringRef is opaque from our side and we just thread the
+// pointer from HAL → AudioQueueSetProperty → CFRelease. Only `CFRelease`
+// is needed; we deliberately avoid `CFStringCreateWith*` / `CFStringGetCString`
+// to keep the CoreFoundation footprint single-symbol.
+
+#[repr(C)]
+struct OpaqueCFType {
+    _p: [u8; 0],
+}
+/// CFTypeRef / CFStringRef — both are opaque pointers from our POV.
+type CFTypeRef = *const OpaqueCFType;
+
+type Fn_CFRelease = unsafe extern "C" fn(cf: CFTypeRef);
+
+struct CfLib {
+    _lib: Library,
+    CFRelease: Fn_CFRelease,
+}
+
+unsafe impl Send for CfLib {}
+unsafe impl Sync for CfLib {}
+
+impl CfLib {
+    fn load() -> std::result::Result<Arc<Self>, libloading::Error> {
+        const CANDIDATES: &[&str] = &[
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation",
+            "CoreFoundation.framework/CoreFoundation",
+            "CoreFoundation",
+        ];
+        let mut last_err: Option<libloading::Error> = None;
+        for &path in CANDIDATES {
+            match unsafe { Library::new(path) } {
+                Ok(lib) => return Self::bind(lib),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.expect("CANDIDATES is non-empty"))
+    }
+
+    fn bind(lib: Library) -> std::result::Result<Arc<Self>, libloading::Error> {
+        unsafe {
+            let s: Symbol<Fn_CFRelease> = lib.get(b"CFRelease\0")?;
+            let f = *s;
+            Ok(Arc::new(CfLib {
+                CFRelease: f,
+                _lib: lib,
+            }))
+        }
+    }
+}
+
+/// Load (and cache) `CoreFoundation.framework`. Like `ca_lib`, a failure to
+/// load surfaces as `None` rather than poisoning `open()` — per-device
+/// routing is degraded to an `UnsupportedFormat` error in that case so the
+/// caller can either retry against the default endpoint or surface the
+/// platform-misconfigured state.
+fn cf_lib() -> Option<Arc<CfLib>> {
+    static CACHED: OnceLock<Mutex<Option<Option<Arc<CfLib>>>>> = OnceLock::new();
+    let slot = CACHED.get_or_init(|| Mutex::new(None));
+    let mut g = slot.lock().unwrap();
+    if let Some(slot) = g.as_ref() {
+        return slot.clone();
+    }
+    let loaded = CfLib::load().ok();
+    *g = Some(loaded.clone());
+    loaded
+}
+
+/// Query `kAudioDevicePropertyDeviceUID` for `device` and return the raw
+/// CFStringRef the HAL handed back. The caller owns the reference (Apple's
+/// "Get/Copy" rule: any "Copy" / "Create" — and the docs explicitly state
+/// the caller is responsible for releasing the returned CFObject) and
+/// must `CFRelease` it once the AudioQueue has consumed it. Returns
+/// `None` if the property is unavailable or the size is wrong.
+unsafe fn hal_get_device_uid(ca: &CaLib, device: AudioObjectID) -> Option<CFTypeRef> {
+    let addr = AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyDeviceUID,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let mut value: CFTypeRef = ptr::null();
+    let mut size: u32 = std::mem::size_of::<CFTypeRef>() as u32;
+    let r = (ca.AudioObjectGetPropertyData)(
+        device,
+        &addr,
+        0,
+        ptr::null(),
+        &mut size,
+        &mut value as *mut CFTypeRef as *mut c_void,
+    );
+    if r == 0 && !value.is_null() && size as usize == std::mem::size_of::<CFTypeRef>() {
+        Some(value)
+    } else {
+        None
+    }
+}
+
 /// Query `prop` from `object` as a single `u32`. Returns `None` if the
 /// property is missing, the wrong size, or the getter fails.
 unsafe fn hal_get_u32(ca: &CaLib, object: AudioObjectID, selector: u32, scope: u32) -> Option<u32> {
@@ -395,41 +525,47 @@ unsafe fn hal_first_output_stream(ca: &CaLib, device: AudioObjectID) -> Option<A
     buf.into_iter().next().filter(|id| *id != 0)
 }
 
-/// Total hardware-side latency (in frames) for the current output
-/// device. Sums `device_latency`, `buffer_frame_size`, `safety_offset`
-/// and `stream_latency` per the HAL reference. Returns `None` if we
-/// can't resolve a device to query, in which case callers should fall
-/// back to the software-only floor.
+/// Total hardware-side latency (in frames) for an output device. Sums
+/// `device_latency`, `buffer_frame_size`, `safety_offset` and
+/// `stream_latency` per the HAL reference. Returns `None` if we can't
+/// resolve a device to query, in which case callers should fall back to
+/// the software-only floor.
 ///
-/// **Device resolution**: Apple's docs state that
-/// `kAudioQueueProperty_CurrentDevice` has value type `CFStringRef`
-/// (a device UID), not `AudioDeviceID` — decoding that would drag in
-/// CoreFoundation bindings this crate has deliberately avoided. The
-/// AudioQueue we build never has `AudioQueueSetProperty` called on
-/// it, so it always follows the system default output. We therefore
-/// resolve via `kAudioHardwarePropertyDefaultOutputDevice` on the HAL
-/// root, which yields the same numeric `AudioDeviceID` the queue is
-/// using. This is already the shape Chromium/Firefox/etc. end up at
-/// after doing the UID→DeviceID dance; we just skip the middle.
-unsafe fn query_hardware_latency_frames(ca: &CaLib) -> Option<u32> {
-    let default_addr = AudioObjectPropertyAddress {
-        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-        mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: kAudioObjectPropertyElementMain,
+/// **Device resolution**: when `bound_device` is `Some(id)` (the queue
+/// was explicitly routed via `kAudioQueueProperty_CurrentDevice`), the
+/// HAL is queried on that id directly so latency stays correct after
+/// per-device routing. When `None`, the queue follows the system
+/// default and we resolve `kAudioHardwarePropertyDefaultOutputDevice`
+/// at call time — which keeps the figure live across user-driven
+/// default-output switches.
+unsafe fn query_hardware_latency_frames(
+    ca: &CaLib,
+    bound_device: Option<AudioObjectID>,
+) -> Option<u32> {
+    let device = match bound_device {
+        Some(d) if d != 0 => d,
+        _ => {
+            let default_addr = AudioObjectPropertyAddress {
+                mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain,
+            };
+            let mut device: AudioObjectID = 0;
+            let mut size: u32 = std::mem::size_of::<AudioObjectID>() as u32;
+            let r = (ca.AudioObjectGetPropertyData)(
+                kAudioObjectSystemObject,
+                &default_addr,
+                0,
+                ptr::null(),
+                &mut size,
+                &mut device as *mut AudioObjectID as *mut c_void,
+            );
+            if r != 0 || device == 0 {
+                return None;
+            }
+            device
+        }
     };
-    let mut device: AudioObjectID = 0;
-    let mut size: u32 = std::mem::size_of::<AudioObjectID>() as u32;
-    let r = (ca.AudioObjectGetPropertyData)(
-        kAudioObjectSystemObject,
-        &default_addr,
-        0,
-        ptr::null(),
-        &mut size,
-        &mut device as *mut AudioObjectID as *mut c_void,
-    );
-    if r != 0 || device == 0 {
-        return None;
-    }
 
     // Device-side fixed latency + live buffer size + safety offset on
     // the OUTPUT scope. Any of these may be unreported on exotic
@@ -772,18 +908,46 @@ unsafe fn open_inner(
     req: StreamRequest,
     cb: Callback,
 ) -> Result<Box<dyn StreamImpl>> {
-    // Per-device routing on AudioQueue needs `kAudioQueueProperty_CurrentDevice`,
-    // which takes a CFStringRef device UID rather than the numeric
-    // AudioDeviceID we expose in `Device::id`. Adding the CoreFoundation
-    // glue to bridge that is a follow-up; until then, surface a clean
-    // error rather than silently ignoring `req.device` and playing on
-    // the system default. See crate README "Non-goals".
-    if req.device.is_some() {
-        return Err(Error::UnsupportedFormat {
-            backend: "coreaudio",
-            detail: "per-device opening not yet wired (needs CFString device UID)".into(),
-        });
-    }
+    // Per-device routing on AudioQueue takes a CFStringRef device UID
+    // (`kAudioQueueProperty_CurrentDevice`), whereas the opaque `Device::id`
+    // we expose is the numeric `AudioDeviceID`. The HAL bridges between the
+    // two: query `kAudioDevicePropertyDeviceUID` on the numeric id, hand the
+    // resulting CFStringRef straight to `AudioQueueSetProperty`, then
+    // `CFRelease` it once the queue has copied the value. CoreFoundation is
+    // dlopen'd through `cf_lib()` so the no-link-time-deps invariant holds.
+    //
+    // If the caller asked for a device but the platform fails any required
+    // step (CF can't load, the id isn't a decimal AudioDeviceID, the device
+    // has no UID, or the AudioQueue refuses the property), surface a clean
+    // `UnsupportedFormat` rather than silently routing to the system default —
+    // that would defeat the entire purpose of `open_on` / `with_device`.
+    let routing: Option<(AudioObjectID, Arc<CfLib>, Arc<CaLib>)> = match req.device.as_deref() {
+        None => None,
+        Some(id_str) => {
+            let device_id: AudioObjectID =
+                id_str.parse().map_err(|_| Error::UnsupportedFormat {
+                    backend: "coreaudio",
+                    detail: format!(
+                        "device id {id_str:?} is not a numeric AudioDeviceID (must come from \
+                         output_devices() on the same coreaudio backend)"
+                    ),
+                })?;
+            let ca = ca_lib().ok_or(Error::UnsupportedFormat {
+                backend: "coreaudio",
+                detail: "CoreAudio.framework HAL is required for per-device routing but failed \
+                         to load"
+                    .into(),
+            })?;
+            let cf = cf_lib().ok_or(Error::UnsupportedFormat {
+                backend: "coreaudio",
+                detail: "CoreFoundation.framework is required for per-device routing but failed \
+                         to load"
+                    .into(),
+            })?;
+            Some((device_id, cf, ca))
+        }
+    };
+
     let _ = LIB_FOR_CALLBACK.set(l.clone()); // no-op on subsequent opens
 
     let channels = req.channels.clamp(1, 8);
@@ -816,6 +980,51 @@ unsafe fn open_inner(
             backend: "coreaudio",
             detail: format!("AudioQueueNewOutput OSStatus={r}"),
         });
+    }
+
+    // Per-device routing: now that the queue exists, bind it to the
+    // caller-requested endpoint before any buffer is enqueued or
+    // `AudioQueueStart` runs. Per `AudioQueue.h` the property must be set
+    // before the queue is started; setting it on a running queue is
+    // ill-defined and typically returns `kAudioQueueErr_CannotStart`.
+    if let Some((device_id, cf, ca)) = routing.as_ref() {
+        let uid = match hal_get_device_uid(ca, *device_id) {
+            Some(u) => u,
+            None => {
+                (l.AudioQueueDispose)(queue, 1);
+                drop(Box::from_raw(state_ptr));
+                return Err(Error::UnsupportedFormat {
+                    backend: "coreaudio",
+                    detail: format!(
+                        "AudioDeviceID {device_id} has no DeviceUID property — not an \
+                         output device or HAL refused the query"
+                    ),
+                });
+            }
+        };
+        // AudioQueueSetProperty takes a pointer-to-CFStringRef (the property
+        // value is CFStringRef, so the inData pointer is `&CFStringRef` and
+        // inDataSize is `sizeof(CFStringRef)`).
+        let r = (l.AudioQueueSetProperty)(
+            queue,
+            kAudioQueueProperty_CurrentDevice,
+            &uid as *const CFTypeRef as *const c_void,
+            std::mem::size_of::<CFTypeRef>() as u32,
+        );
+        // The queue retained the CFString internally (or refused, in which
+        // case there's nothing to undo on the queue side). Either way the
+        // HAL handed us a +1 ref to drop — Apple's get/copy rule: the
+        // `kAudioDevicePropertyDeviceUID` docs say "the caller is
+        // responsible for releasing the returned CFObject".
+        (cf.CFRelease)(uid);
+        if r != 0 {
+            (l.AudioQueueDispose)(queue, 1);
+            drop(Box::from_raw(state_ptr));
+            return Err(Error::DeviceOpen {
+                backend: "coreaudio",
+                detail: format!("AudioQueueSetProperty(CurrentDevice={device_id}) OSStatus={r}"),
+            });
+        }
     }
 
     // `NUM_BUFFERS` buffers × ~20 ms each. The CA thread round-robins
@@ -872,6 +1081,12 @@ unsafe fn open_inner(
     // macOS), `latency()` simply returns the software floor.
     let ca = ca_lib();
 
+    // If we routed the queue at a specific device, lock latency queries
+    // onto that device; otherwise the queue follows the system default
+    // and `query_hardware_latency_frames` resolves the default at call
+    // time (the historical behaviour).
+    let bound_device = routing.as_ref().map(|(id, _, _)| *id);
+
     Ok(Box::new(CoreAudioStream {
         lib: l,
         ca,
@@ -879,6 +1094,7 @@ unsafe fn open_inner(
         state_ptr,
         paused,
         sw_latency_ns,
+        bound_device,
         format: StreamFormat {
             sample_rate: req.sample_rate,
             channels,
@@ -906,6 +1122,13 @@ struct CoreAudioStream {
     /// × frames_per_buf` component. See `open_inner`. The HAL-reported
     /// hardware component is added at `latency()`-call time.
     sw_latency_ns: u64,
+    /// The AudioDeviceID this queue was routed to via
+    /// `kAudioQueueProperty_CurrentDevice`, or `None` if the queue is
+    /// following the system default endpoint. `latency()` queries the HAL
+    /// against this id when set, so the figure stays correct for streams
+    /// pinned to a non-default device (e.g. opened through `open_on`
+    /// against a USB DAC).
+    bound_device: Option<AudioObjectID>,
     format: StreamFormat,
     stopped: bool,
 }
@@ -941,7 +1164,7 @@ impl StreamImpl for CoreAudioStream {
         if let Some(ca) = self.ca.as_ref() {
             // SAFETY: `ca` owns its `Library` handle, so the fn
             // pointer stays mapped for the duration of the call.
-            let hw_frames = unsafe { query_hardware_latency_frames(ca) };
+            let hw_frames = unsafe { query_hardware_latency_frames(ca, self.bound_device) };
             if let Some(frames) = hw_frames {
                 let rate = self.format.sample_rate.max(1) as u64;
                 let hw_ns = (frames as u64).saturating_mul(1_000_000_000) / rate;
@@ -1009,10 +1232,50 @@ mod tests {
         // Device-enumeration selectors.
         assert_eq!(kAudioHardwarePropertyDevices, u32::from_be_bytes(*b"dev#"));
         assert_eq!(kAudioDevicePropertyDeviceName, u32::from_be_bytes(*b"name"));
+        // Per-device routing selectors (AudioHardwareBase.h l. 734 +
+        // AudioQueue.h l. 271 in the macOS 26 SDK).
+        assert_eq!(kAudioDevicePropertyDeviceUID, u32::from_be_bytes(*b"uid "));
+        assert_eq!(
+            kAudioQueueProperty_CurrentDevice,
+            u32::from_be_bytes(*b"aqcd")
+        );
         // Cross-check against the existing `kAudioFormatLinearPCM`
         // literal to make sure our `four_cc` helper matches the
         // hand-written form used elsewhere in this file.
         assert_eq!(four_cc(b"lpcm"), kAudioFormatLinearPCM);
+    }
+
+    #[test]
+    fn non_numeric_device_id_returns_unsupported_format() {
+        // The CoreAudio `Device::id` is the decimal `AudioDeviceID`. A caller
+        // that hands us an opaque blob from a different backend (or otherwise
+        // fabricates one) must NOT silently fall back to the system default —
+        // they explicitly asked for a non-default device, so we surface
+        // `UnsupportedFormat` from the parse step. This test exercises the
+        // routing precondition without needing CoreAudio.framework to load
+        // (it short-circuits at the str::parse step before any HAL call).
+        use crate::format::StreamRequest;
+        let backend = CoreAudioBackend;
+        let req = StreamRequest::new(48_000, 2).with_device("not-a-decimal-id");
+        let r = backend.open(req, Box::new(|_, _| {}));
+        match r {
+            Err(crate::Error::UnsupportedFormat { backend, detail }) => {
+                assert_eq!(backend, "coreaudio");
+                assert!(
+                    detail.contains("not a numeric AudioDeviceID"),
+                    "expected parse-failure message, got: {detail}"
+                );
+            }
+            // AudioToolbox.framework couldn't be loaded — the routing check
+            // wraps the AtLib load, so a `LibraryLoad` error is also acceptable
+            // on hosts where the framework isn't available (which shouldn't be
+            // any real macOS, but covers cross-target builds).
+            Err(crate::Error::LibraryLoad { .. }) => {}
+            Err(other) => {
+                panic!("expected UnsupportedFormat for fabricated id, got error variant: {other}")
+            }
+            Ok(_) => panic!("CoreAudio accepted a non-numeric device id; routing bug"),
+        }
     }
 
     #[test]
