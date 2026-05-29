@@ -165,6 +165,21 @@ where
     open(d, req, cb)
 }
 
+/// Open an output stream on a specific enumerated [`Device`]. Equivalent
+/// to `open(driver, req.with_device(device.id.clone()), cb)`; supplied
+/// as a convenience so the device handle the caller already has from
+/// [`Driver::output_devices`] is the natural argument.
+///
+/// The [`Device`] must come from the same `driver` that's being passed —
+/// device ids are backend-native opaque strings and won't resolve on a
+/// different backend.
+pub fn open_on<F>(driver: Driver, device: &Device, req: StreamRequest, cb: F) -> Result<Stream>
+where
+    F: FnMut(&mut [f32], &CallbackInfo) + Send + 'static,
+{
+    open(driver, req.with_device(device.id.clone()), cb)
+}
+
 /// Enumerate the playback (output) devices visible on `driver`. Thin
 /// wrapper over [`Driver::output_devices`]; see that method for the
 /// empty-list-vs-error contract.
@@ -210,6 +225,56 @@ mod tests {
                 // a headless CI box without a sound server.
                 Err(_) => {}
             }
+        }
+    }
+
+    #[test]
+    fn stream_request_with_device_roundtrip() {
+        // The `with_device` builder threads the opaque id into the
+        // request without otherwise disturbing rate/channels/format.
+        let req = StreamRequest::new(48_000, 2).with_device("plughw:CARD=PCH,DEV=0");
+        assert_eq!(req.sample_rate, 48_000);
+        assert_eq!(req.channels, 2);
+        assert_eq!(req.format, SampleFormat::F32);
+        assert_eq!(req.device.as_deref(), Some("plughw:CARD=PCH,DEV=0"));
+        // Default ctor leaves `device` unset → backends pick the system
+        // default endpoint as before.
+        let plain = StreamRequest::new(44_100, 1);
+        assert!(plain.device.is_none());
+    }
+
+    #[test]
+    fn stream_request_with_buffer_frames_builder() {
+        // None → backend's own default; Some(N) is a hint, not a constraint.
+        let r = StreamRequest::new(48_000, 2).with_buffer_frames(Some(256));
+        assert_eq!(r.buffer_frames, Some(256));
+        let r2 = r.with_buffer_frames(None);
+        assert_eq!(r2.buffer_frames, None);
+    }
+
+    #[test]
+    fn open_on_with_alien_id_fails_cleanly() {
+        // Don't actually open hardware (CI is headless), but exercise
+        // the dispatch path: a non-existent id should produce an Err of
+        // the *DeviceOpen* / NotImplemented / LibraryLoad family, never
+        // a panic, and never an `Ok` on a fabricated id.
+        for d in drivers() {
+            let dev = Device {
+                id: "this-device-does-not-exist-on-any-backend".into(),
+                name: "fake".into(),
+                is_default: false,
+            };
+            let req = StreamRequest::new(48_000, 2);
+            let r = open_on(d, &dev, req, |_, _| {});
+            // We don't assert *which* error variant — that depends on
+            // whether the backend's shared library even loads in CI —
+            // only that we got one rather than a successful open against
+            // a fabricated id.
+            assert!(
+                r.is_err(),
+                "{} accepted a fabricated device id; this is a routing bug",
+                d.name()
+            );
         }
     }
 

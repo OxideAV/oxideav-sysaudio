@@ -520,7 +520,7 @@ impl Backend for WasapiBackend {
         let l = lib()?;
         unsafe {
             co_init(&l);
-            let (client, _wfx) = activate_default_client(&l)?;
+            let (client, _wfx) = activate_client(&l, None)?;
             com_release(client);
             (l.CoUninitialize)();
         }
@@ -685,11 +685,18 @@ unsafe fn enumerate_output_devices(l: &WinLibs) -> Result<Vec<Device>> {
     Ok(out)
 }
 
-/// Resolve IMMDeviceEnumerator → default endpoint → IAudioClient and
-/// its mix format. Caller owns both the returned client (must be
-/// Released) and the WAVEFORMATEX* (must be CoTaskMemFree'd — we return
-/// it boxed so the caller can reuse it for Initialize).
-unsafe fn activate_default_client(l: &WinLibs) -> Result<(*mut c_void, *mut WAVEFORMATEX)> {
+/// Resolve IMMDeviceEnumerator → endpoint → IAudioClient and its mix
+/// format. When `device_id` is `None`, picks the system default eRender
+/// console endpoint (historical behaviour). When `Some(id)`, calls
+/// `IMMDeviceEnumerator::GetDevice` with the LPWSTR endpoint id the
+/// caller obtained from `output_devices()`. Caller owns both the
+/// returned client (must be Released) and the WAVEFORMATEX* (must be
+/// CoTaskMemFree'd — we return it boxed so the caller can reuse it for
+/// Initialize).
+unsafe fn activate_client(
+    l: &WinLibs,
+    device_id: Option<&str>,
+) -> Result<(*mut c_void, *mut WAVEFORMATEX)> {
     // 1. CoCreateInstance(CLSID_MMDeviceEnumerator, …, IID_IMMDeviceEnumerator)
     let mut enumer: *mut c_void = ptr::null_mut();
     let hr = (l.CoCreateInstance)(
@@ -706,15 +713,29 @@ unsafe fn activate_default_client(l: &WinLibs) -> Result<(*mut c_void, *mut WAVE
         });
     }
 
-    // 2. GetDefaultAudioEndpoint(eRender=0, eConsole=0, &pDevice)
+    // 2. Resolve an endpoint pointer. Default path is
+    //    `GetDefaultAudioEndpoint(eRender=0, eConsole=0)`; the
+    //    explicit-device path is `GetDevice(LPCWSTR id)`.
     let enumer_vtbl = *(enumer as *mut *const IMMDeviceEnumeratorVtbl);
     let mut device: *mut c_void = ptr::null_mut();
-    let hr = ((*enumer_vtbl).GetDefaultAudioEndpoint)(enumer, 0, 0, &mut device);
+    let hr = match device_id {
+        None => ((*enumer_vtbl).GetDefaultAudioEndpoint)(enumer, 0, 0, &mut device),
+        Some(id) => {
+            // LPCWSTR — UTF-16 with NUL terminator.
+            let wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
+            ((*enumer_vtbl).GetDevice)(enumer, wide.as_ptr(), &mut device)
+        }
+    };
     if hr != S_OK || device.is_null() {
         com_release(enumer);
+        let api = if device_id.is_some() {
+            "IMMDeviceEnumerator::GetDevice"
+        } else {
+            "GetDefaultAudioEndpoint"
+        };
         return Err(Error::DeviceOpen {
             backend: "wasapi",
-            detail: format!("GetDefaultAudioEndpoint HRESULT=0x{hr:08X}"),
+            detail: format!("{api} HRESULT=0x{hr:08X}"),
         });
     }
     com_release(enumer);
@@ -776,11 +797,11 @@ unsafe fn inspect_format(pwfx: *const WAVEFORMATEX) -> Option<(bool, u16)> {
 
 unsafe fn open_inner(
     l: Arc<WinLibs>,
-    _req: StreamRequest,
+    req: StreamRequest,
     cb: Callback,
 ) -> Result<Box<dyn StreamImpl>> {
     co_init(&l);
-    let (client, pwfx) = activate_default_client(&l)?;
+    let (client, pwfx) = activate_client(&l, req.device.as_deref())?;
     let channels = (*pwfx).nChannels;
     let sample_rate = (*pwfx).nSamplesPerSec;
     let (is_float, bits) = match inspect_format(pwfx) {

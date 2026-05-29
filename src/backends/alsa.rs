@@ -469,7 +469,16 @@ unsafe fn open_inner(
     req: StreamRequest,
     cb: Callback,
 ) -> Result<Box<dyn StreamImpl>> {
-    let name = CString::new("default").unwrap();
+    // Honor `req.device` if the caller wants a specific PCM. For ALSA
+    // the enumerated `Device::id` IS the PCM name (`snd_device_name_hint`
+    // returns it under the "NAME" key), so we pass it straight to
+    // `snd_pcm_open`. A NUL byte inside the string would be a malformed
+    // id; reject it as DeviceOpen rather than silently truncating.
+    let pcm_name = req.device.as_deref().unwrap_or("default");
+    let name = CString::new(pcm_name).map_err(|_| Error::DeviceOpen {
+        backend: "alsa",
+        detail: "device id contains an interior NUL byte".into(),
+    })?;
     let mut pcm: *mut snd_pcm_t = ptr::null_mut();
     let r = (l.snd_pcm_open)(&mut pcm, name.as_ptr(), SND_PCM_STREAM_PLAYBACK, 0);
     if r < 0 {

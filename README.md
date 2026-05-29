@@ -101,15 +101,52 @@ All backends are enabled by default. Disabling a feature omits the
 module entirely — useful for minimising binary size on platforms
 where, e.g., you know you'll never need PulseAudio.
 
+## Opening a specific device
+
+`StreamRequest::with_device(id)` (or the lower-level `StreamRequest`
+`device` field) binds the stream to a specific enumerated endpoint,
+identified by the opaque `id` returned in `Device::id` by the same
+backend's `output_devices()` call. The free `open_on(driver, &device,
+req, cb)` is the natural shortcut when you already have a `Device`
+in hand:
+
+```rust
+let d = oxideav_sysaudio::default_driver().ok_or("no driver")?;
+for dev in d.output_devices()? {
+    if dev.name.contains("USB Headset") {
+        let req = oxideav_sysaudio::StreamRequest::new(48_000, 2);
+        let stream = oxideav_sysaudio::open_on(d, &dev, req, |out, _| {
+            out.fill(0.0);
+        })?;
+        // ... play through the USB headset specifically ...
+        break;
+    }
+}
+```
+
+| Backend   | Per-device routing                                                              |
+| --------- | ------------------------------------------------------------------------------- |
+| ALSA      | `id` is the PCM name; passed straight to `snd_pcm_open`.                        |
+| PulseAudio| `id` is a sink name; passed as the `dev` arg of `pa_simple_new`.                |
+| WASAPI    | `id` is the LPWSTR endpoint id; resolved via `IMMDeviceEnumerator::GetDevice`.  |
+| CoreAudio | Not wired — needs the CFString device UID; `Err(UnsupportedFormat)`. (follow-up) |
+
+Leaving `device` as `None` (the default constructor) opens the system
+default endpoint, matching the historical `open()` / `open_default()`
+behaviour.
+
 ## Non-goals (for now)
 
 - **Audio capture / input streams.** Output only.
-- **Opening a non-default device.** Enumeration lists every output
-  device (see above), but `open()` still binds the system default;
-  routing to a specific enumerated `Device::id` is a follow-up.
 - **PulseAudio device enumeration.** The "simple" API exposes no sink
   introspection; it returns an empty list. The full async
   `pa_context_get_sink_info_list` path is a follow-up.
+- **CoreAudio per-device routing.** Enumeration works, but binding an
+  AudioQueue to a specific enumerated `AudioDeviceID` needs the device
+  UID (CFStringRef) and CoreFoundation glue we have not added yet. A
+  caller that passes a `device` on macOS gets a clean
+  `Err(UnsupportedFormat)` rather than a silent fallback to the
+  default endpoint.
 - **Sample formats other than f32** on the public callback surface.
   Backends convert internally where the hardware insists on S16 or
   similar.

@@ -34,7 +34,17 @@ fn main() {
 
     let sample_rate = 48_000u32;
     let channels = 2u16;
-    let req = oxideav_sysaudio::StreamRequest::new(sample_rate, channels);
+    // If `OXIDEAV_SYSAUDIO_DEVICE` is set, route to that enumerated id;
+    // otherwise fall back to the system default. The id format depends on
+    // the active backend — see crate README "Opening a specific device".
+    let device_override = std::env::var("OXIDEAV_SYSAUDIO_DEVICE").ok();
+    let req = match device_override.as_deref() {
+        Some(id) => {
+            println!("\nRouting to device id: {id}");
+            oxideav_sysaudio::StreamRequest::new(sample_rate, channels).with_device(id)
+        }
+        None => oxideav_sysaudio::StreamRequest::new(sample_rate, channels),
+    };
 
     let phase = Arc::new(AtomicU64::new(0));
     let phase_cb = phase.clone();

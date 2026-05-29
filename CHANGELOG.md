@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(api)* per-device opening: `StreamRequest::with_device(id)` (and the
+  underlying `StreamRequest::device: Option<String>`) plus the free
+  `open_on(driver, &device, req, cb)` convenience. Closes the previous
+  "non-default device" non-goal — callers can pipe an enumerated
+  `Device::id` straight back into `open()`. ALSA routes the id as the
+  PCM name to `snd_pcm_open`; PulseAudio passes it as the `dev` arg of
+  `pa_simple_new`; WASAPI resolves it through
+  `IMMDeviceEnumerator::GetDevice` (LPWSTR). CoreAudio still requires a
+  CFString device UID for AudioQueue routing, so `device.is_some()` on
+  macOS returns `Err(UnsupportedFormat)` rather than silently opening
+  the default endpoint. `StreamRequest` is now `Clone` (no longer
+  `Copy`) so it can carry an owned `String` id.
 - *(api)* output-device enumeration: `Device { id, name, is_default }`,
   `Driver::output_devices()` and the free `output_devices(driver)`. Each
   backend lists its playback endpoints with the OS-friendly name and a

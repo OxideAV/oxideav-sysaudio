@@ -201,13 +201,29 @@ impl Backend for PulseBackend {
         };
         let app = CString::new("oxideav-sysaudio").unwrap();
         let stream_name = CString::new("playback").unwrap();
+        // If the caller named a specific sink, hand it to `pa_simple_new`
+        // as `dev`. The "simple" API doesn't enumerate sinks itself, but
+        // the underlying PulseAudio server happily takes a sink name on
+        // open — callers obtain the name out-of-band (`pactl list sinks
+        // short`). `None` keeps the historical default-sink behaviour.
+        let dev_cstring = match req.device.as_deref() {
+            Some(name) => Some(CString::new(name).map_err(|_| Error::DeviceOpen {
+                backend: "pulse",
+                detail: "device id contains an interior NUL byte".into(),
+            })?),
+            None => None,
+        };
+        let dev_ptr = dev_cstring
+            .as_ref()
+            .map(|c| c.as_ptr())
+            .unwrap_or(ptr::null());
         let handle = unsafe {
             let mut err: c_int = 0;
             let s = (l.pa_simple_new)(
                 ptr::null(),
                 app.as_ptr(),
                 PA_STREAM_PLAYBACK,
-                ptr::null(),
+                dev_ptr,
                 stream_name.as_ptr(),
                 &spec,
                 ptr::null(),

@@ -772,6 +772,18 @@ unsafe fn open_inner(
     req: StreamRequest,
     cb: Callback,
 ) -> Result<Box<dyn StreamImpl>> {
+    // Per-device routing on AudioQueue needs `kAudioQueueProperty_CurrentDevice`,
+    // which takes a CFStringRef device UID rather than the numeric
+    // AudioDeviceID we expose in `Device::id`. Adding the CoreFoundation
+    // glue to bridge that is a follow-up; until then, surface a clean
+    // error rather than silently ignoring `req.device` and playing on
+    // the system default. See crate README "Non-goals".
+    if req.device.is_some() {
+        return Err(Error::UnsupportedFormat {
+            backend: "coreaudio",
+            detail: "per-device opening not yet wired (needs CFString device UID)".into(),
+        });
+    }
     let _ = LIB_FOR_CALLBACK.set(l.clone()); // no-op on subsequent opens
 
     let channels = req.channels.clamp(1, 8);
