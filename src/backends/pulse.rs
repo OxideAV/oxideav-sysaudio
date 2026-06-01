@@ -45,6 +45,23 @@ struct pa_sample_spec {
     channels: u8,
 }
 
+/// `pa_buffer_attr` from `pulse/def.h`. Five `u32` fields ordered
+/// `maxlength`, `tlength`, `prebuf`, `minreq`, `fragsize`. Each is a
+/// **byte** count or `u32::MAX` ("let the server pick"). For playback
+/// the server reads `tlength` (target playback-buffer length) and
+/// `minreq` (smallest poll the server wants before refilling); the
+/// other three fields belong to the capture path or to overall sizing
+/// and stay sentinel.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct pa_buffer_attr {
+    maxlength: u32,
+    tlength: u32,
+    prebuf: u32,
+    minreq: u32,
+    fragsize: u32,
+}
+
 type Fn_pa_simple_new = unsafe extern "C" fn(
     server: *const c_char,
     name: *const c_char,
@@ -53,7 +70,7 @@ type Fn_pa_simple_new = unsafe extern "C" fn(
     stream_name: *const c_char,
     ss: *const pa_sample_spec,
     map: *const c_void,
-    attr: *const c_void,
+    attr: *const pa_buffer_attr,
     error: *mut c_int,
 ) -> *mut pa_simple;
 
@@ -149,6 +166,35 @@ fn lib() -> Result<Arc<PulseLib>> {
 // Backend impl.
 // ---------------------------------------------------------------------------
 
+/// Build a `pa_buffer_attr` from a frame-count hint, the stream's
+/// sample rate, and the per-frame byte size. `tlength` is the requested
+/// playback-buffer byte count; `minreq` is the smallest refill the
+/// server should ask for and is capped at `tlength` so the server never
+/// rejects a hint with `minreq > tlength`. The other three fields stay
+/// sentinel (`u32::MAX`) so the server picks defaults for them, the
+/// same as what NULL would have done.
+fn make_buffer_attr(
+    buffer_frames: u32,
+    sample_rate: u32,
+    bytes_per_frame: usize,
+) -> pa_buffer_attr {
+    let tlength_bytes = (buffer_frames as u64).saturating_mul(bytes_per_frame as u64);
+    let tlength = u32::try_from(tlength_bytes).unwrap_or(u32::MAX);
+    // ~20 ms of frames at the request's rate, but never above the
+    // tlength itself (the server rejects `minreq > tlength`).
+    let one_period_frames = ((sample_rate as usize) / 50).max(64);
+    let one_period_bytes = (one_period_frames as u64).saturating_mul(bytes_per_frame as u64);
+    let minreq_bytes = one_period_bytes.min(tlength_bytes.max(1));
+    let minreq = u32::try_from(minreq_bytes).unwrap_or(u32::MAX);
+    pa_buffer_attr {
+        maxlength: u32::MAX,
+        tlength,
+        prebuf: u32::MAX,
+        minreq,
+        fragsize: u32::MAX,
+    }
+}
+
 pub(crate) struct PulseBackend;
 
 impl Backend for PulseBackend {
@@ -177,7 +223,7 @@ impl Backend for PulseBackend {
                 name.as_ptr(),
                 &spec,
                 ptr::null(),
-                ptr::null(),
+                ptr::null::<pa_buffer_attr>(),
                 &mut err,
             );
             if s.is_null() {
@@ -217,6 +263,28 @@ impl Backend for PulseBackend {
             .as_ref()
             .map(|c| c.as_ptr())
             .unwrap_or(ptr::null());
+
+        // Bytes per frame at the agreed sample format. `pa_buffer_attr`
+        // is byte-denominated, so a frame-count hint needs the per-frame
+        // byte size to translate. F32 = 4 bytes × channels.
+        let bytes_per_frame = (channels as usize) * 4;
+        // Honour `StreamRequest::buffer_frames` as a server-side hint:
+        // when present, fill a `pa_buffer_attr` with `tlength` set to
+        // the requested byte count and `minreq` set to roughly one
+        // period (we keep ~20 ms when the hint is large, but never less
+        // than the hint itself so the server doesn't ask for refills
+        // smaller than the worker writes at). The other three fields
+        // stay sentinel (`u32::MAX`) so the server picks defaults for
+        // them, matching what NULL would have done. Without the hint we
+        // continue to pass NULL so the server picks every field.
+        let attr_storage: Option<pa_buffer_attr> = req
+            .buffer_frames
+            .map(|frames| make_buffer_attr(frames, req.sample_rate, bytes_per_frame));
+        let attr_ptr: *const pa_buffer_attr = attr_storage
+            .as_ref()
+            .map(|a| a as *const pa_buffer_attr)
+            .unwrap_or(ptr::null());
+
         let handle = unsafe {
             let mut err: c_int = 0;
             let s = (l.pa_simple_new)(
@@ -227,7 +295,7 @@ impl Backend for PulseBackend {
                 stream_name.as_ptr(),
                 &spec,
                 ptr::null(),
-                ptr::null(),
+                attr_ptr,
                 &mut err,
             );
             if s.is_null() {
@@ -239,8 +307,14 @@ impl Backend for PulseBackend {
             s
         };
 
-        // ~20 ms period — same target as ALSA so latency feels the same.
-        let period_frames = ((req.sample_rate as usize) / 50).max(64);
+        // Worker period follows the hint when one was given so the
+        // server-side `minreq` and the client-side write size stay
+        // aligned. Without a hint we keep the historical ~20 ms target
+        // that matches the ALSA backend.
+        let period_frames = req
+            .buffer_frames
+            .map(|f| (f as usize).max(64))
+            .unwrap_or_else(|| ((req.sample_rate as usize) / 50).max(64));
         let paused = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let frames_played = Arc::new(AtomicU64::new(0));
@@ -394,5 +468,54 @@ impl StreamImpl for PulseStream {
             let _ = (self.lib.pa_simple_flush)(self.handle.0, &mut err);
             (self.lib.pa_simple_free)(self.handle.0);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buffer_attr_basic_48k_stereo() {
+        // 4_800 frames × 8 bytes/frame (stereo f32) = 38_400 bytes for
+        // tlength. minreq is ~20 ms (= 4_800 frames @48k / 50) = 960
+        // frames × 8 bytes = 7_680 bytes, capped at tlength.
+        let attr = make_buffer_attr(4_800, 48_000, 8);
+        assert_eq!(attr.tlength, 4_800 * 8);
+        assert_eq!(attr.minreq, 960 * 8);
+        assert_eq!(attr.maxlength, u32::MAX);
+        assert_eq!(attr.prebuf, u32::MAX);
+        assert_eq!(attr.fragsize, u32::MAX);
+    }
+
+    #[test]
+    fn buffer_attr_minreq_capped_at_tlength() {
+        // Tiny hint: 32 frames × 8 = 256 bytes. The ~20 ms one-period
+        // computation would yield 64 frames floor (since 48k/50 = 960,
+        // but max(64) gates the lower end) which is still 64 × 8 = 512
+        // bytes — strictly larger than tlength, so the cap kicks in and
+        // pulls minreq down to tlength.
+        let attr = make_buffer_attr(32, 48_000, 8);
+        assert_eq!(attr.tlength, 256);
+        assert_eq!(attr.minreq, 256);
+    }
+
+    #[test]
+    fn buffer_attr_saturates_huge_request() {
+        // A frame count whose byte product overflows u32 must clamp at
+        // u32::MAX rather than wrapping, otherwise the server would see
+        // a small bogus tlength.
+        let attr = make_buffer_attr(u32::MAX, 48_000, 8);
+        assert_eq!(attr.tlength, u32::MAX);
+    }
+
+    #[test]
+    fn buffer_attr_mono_low_rate() {
+        // 8 kHz mono, 80 frames (= 10 ms): tlength = 80 × 4 = 320 bytes.
+        // One period at 8 kHz = max(64, 160) = 160 frames → 640 bytes,
+        // capped at tlength → minreq = 320.
+        let attr = make_buffer_attr(80, 8_000, 4);
+        assert_eq!(attr.tlength, 320);
+        assert_eq!(attr.minreq, 320);
     }
 }

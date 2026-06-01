@@ -135,6 +135,26 @@ Leaving `device` as `None` (the default constructor) opens the system
 default endpoint, matching the historical `open()` / `open_default()`
 behaviour.
 
+## Buffer-size hint
+
+`StreamRequest::with_buffer_frames(Some(n))` (or the underlying
+`buffer_frames: Option<u32>` field) hands every functional backend a
+period-size target measured in frames. The hint is advisory — each
+backend translates it into its native unit and the OS / driver / mix
+engine may clamp it to a supported value. Leaving it as `None`
+preserves the historical backend defaults (roughly 20 ms across the
+board).
+
+| Backend   | Per-backend routing of `buffer_frames`                                                                                  |
+| --------- | ----------------------------------------------------------------------------------------------------------------------- |
+| ALSA      | `snd_pcm_hw_params_set_period_size_near` with the hint; buffer set to `4 × period`.                                     |
+| PulseAudio| Filled into a `pa_buffer_attr` (`tlength = frames × bytes_per_frame`, `minreq` ≈ one period and capped at `tlength`); other fields stay `(uint32_t)-1`. Worker write size follows the hint so client and server stay aligned. |
+| WASAPI    | Translated to `REFERENCE_TIME` (100 ns ticks) via `frames × 10_000_000 / sample_rate` with i128 widening; passed as `hnsBufferDuration` to `IAudioClient::Initialize`. WASAPI clamps below the device's minimum period. |
+| CoreAudio | `kAudioQueueProperty_NumberOfBuffers` × buffer size derived from the hint.                                              |
+
+Sub-millisecond hints round up to at least one tick on WASAPI; massive
+hints saturate rather than overflow.
+
 ## Non-goals (for now)
 
 - **Audio capture / input streams.** Output only.

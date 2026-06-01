@@ -795,6 +795,44 @@ unsafe fn inspect_format(pwfx: *const WAVEFORMATEX) -> Option<(bool, u16)> {
     }
 }
 
+/// Translate `StreamRequest::buffer_frames` into the `REFERENCE_TIME`
+/// (100 ns units) value `IAudioClient::Initialize` expects in its
+/// `hnsBufferDuration` slot.
+///
+/// `None` means "let the system pick", which the caller maps to the
+/// historical ~200 ms target — the WASAPI mix engine clamps the value
+/// to the device's actual minimum period regardless, so the request is
+/// always advisory.
+///
+/// `Some(frames)` is converted with i128 widening so it cannot overflow
+/// at the upper end of the input domain
+/// (`u32::MAX × 10_000_000` already exceeds `i64::MAX`) and rounds *up*
+/// to the next 100 ns tick so a request below one tick still asks for
+/// at least one tick.
+///
+/// `sample_rate` of zero is defended against by saturating the divisor
+/// to one — `IAudioClient::Initialize` would reject the resulting value
+/// anyway, but we keep the helper total so the math stays panic-free.
+fn buffer_duration_ref_time(buffer_frames: Option<u32>, sample_rate: u32) -> REFERENCE_TIME {
+    // Default fallback: ~200 ms expressed in REFERENCE_TIME (100 ns)
+    // units. WASAPI will clamp this to the device's minimum period.
+    const DEFAULT_HNS: REFERENCE_TIME = 200 * 10_000;
+    let Some(frames) = buffer_frames else {
+        return DEFAULT_HNS;
+    };
+    let rate = sample_rate.max(1) as i128;
+    // 100 ns ticks per second = 10_000_000.
+    let numer = (frames as i128) * 10_000_000_i128;
+    // Round up so a sub-tick request still asks for one tick rather
+    // than zero (zero would let WASAPI pick its default, which defeats
+    // the caller's hint).
+    let hns = (numer + rate - 1) / rate;
+    // Clamp into the REFERENCE_TIME (i64) range. The natural cap is
+    // i64::MAX 100 ns ticks ≈ 29_247 years — well past any sane buffer
+    // request, but the saturating conversion keeps the helper total.
+    hns.clamp(0, REFERENCE_TIME::MAX as i128) as REFERENCE_TIME
+}
+
 unsafe fn open_inner(
     l: Arc<WinLibs>,
     req: StreamRequest,
@@ -828,9 +866,13 @@ unsafe fn open_inner(
         });
     }
 
-    // Ask for a 200 ms buffer — WASAPI will clamp to the device's
-    // minimum period internally. REFERENCE_TIME is 100ns units.
-    let buffer_duration: REFERENCE_TIME = 200 * 10_000;
+    // Honour `StreamRequest::buffer_frames` as a hint: convert frames
+    // at the device's sample rate into the REFERENCE_TIME (100 ns)
+    // units `IAudioClient::Initialize` consumes. When the caller leaves
+    // the hint as `None` we fall back to the historical ~200 ms target;
+    // WASAPI will clamp either value to the device's minimum period
+    // internally so the request is always advisory.
+    let buffer_duration: REFERENCE_TIME = buffer_duration_ref_time(req.buffer_frames, sample_rate);
 
     let client_vtbl = *(client as *mut *const IAudioClientVtbl);
     let hr = ((*client_vtbl).Initialize)(
@@ -1368,5 +1410,56 @@ mod tests {
         // freq saturated to 1 → position_frames = 47000 * 48000 / 1 =
         // way more than frames_written → saturating_sub clamps to 0.
         assert_eq!(ns, 0);
+    }
+
+    #[test]
+    fn buffer_duration_ref_time_none_falls_back_to_200ms() {
+        // `None` keeps the historical ~200 ms target so an unhinted
+        // request behaves as before. 200 ms = 200 × 10_000 100ns ticks.
+        assert_eq!(buffer_duration_ref_time(None, 48_000), 2_000_000);
+        // Default does not vary with sample rate — it's a wall-clock
+        // duration, not a frame count.
+        assert_eq!(buffer_duration_ref_time(None, 192_000), 2_000_000);
+    }
+
+    #[test]
+    fn buffer_duration_ref_time_sub_millisecond_request_rounds_up() {
+        // 1 frame at 48 kHz = 1/48_000 s ≈ 208.33 ns ≈ 2.083 ticks of
+        // 100 ns. The helper must round up so a sub-tick request still
+        // asks for at least one tick.
+        let hns = buffer_duration_ref_time(Some(1), 48_000);
+        // ceil(10_000_000 / 48_000) = 209.
+        assert_eq!(hns, 209);
+    }
+
+    #[test]
+    fn buffer_duration_ref_time_exact_one_second_at_48k() {
+        // 48_000 frames at 48 kHz = exactly 1 second = 10_000_000 ticks.
+        let hns = buffer_duration_ref_time(Some(48_000), 48_000);
+        assert_eq!(hns, 10_000_000);
+    }
+
+    #[test]
+    fn buffer_duration_ref_time_thirty_minutes_at_192k() {
+        // 30 min × 60 s × 192_000 Hz = 345_600_000 frames. The result
+        // must be 1_800_000_000_000 ticks (30 min × 60 s × 10 M) and
+        // fit comfortably inside REFERENCE_TIME (i64) without overflow,
+        // which is why the helper widens to i128 for the multiply.
+        let frames: u32 = 30 * 60 * 192_000;
+        let hns = buffer_duration_ref_time(Some(frames), 192_000);
+        assert_eq!(hns, 30 * 60 * 10_000_000);
+        // i128 widening sanity-check: the intermediate product would be
+        // 3.456e15, which is fine for i128 but also still fits i64.
+        assert!(hns < REFERENCE_TIME::MAX);
+    }
+
+    #[test]
+    fn buffer_duration_ref_time_zero_sample_rate_does_not_panic() {
+        // Defence-in-depth: a zero rate would otherwise divide by zero.
+        // We saturate the divisor to 1, which yields a huge but bounded
+        // tick count; the WASAPI Initialize call would then reject it,
+        // but the helper itself stays panic-free.
+        let hns = buffer_duration_ref_time(Some(1), 0);
+        assert_eq!(hns, 10_000_000);
     }
 }

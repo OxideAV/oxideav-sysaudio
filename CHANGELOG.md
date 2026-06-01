@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(wasapi, pulse)* honour `StreamRequest::buffer_frames` on every
+  functional backend. WASAPI translates the hint into the
+  `REFERENCE_TIME` (100 ns ticks) value `IAudioClient::Initialize`
+  consumes via `frames × 10_000_000 / sample_rate` with `i128` widening
+  (so a 30-min hint at 192 kHz still fits without overflow and a
+  sub-millisecond hint rounds up to at least one tick); `None` keeps the
+  historical ~200 ms target. PulseAudio fills a `pa_buffer_attr` with
+  `tlength` set to the requested byte count and `minreq` set to roughly
+  one period (capped at `tlength` so the server doesn't reject
+  `minreq > tlength`); the worker's write size follows the hint so
+  client and server stay aligned. ALSA and CoreAudio already wired the
+  hint in prior rounds — every functional backend now covers it.
 - *(coreaudio)* per-device routing now wired. The numeric `AudioDeviceID`
   exposed in `Device::id` is resolved through the HAL property
   `kAudioDevicePropertyDeviceUID` to a CFStringRef, then handed to
