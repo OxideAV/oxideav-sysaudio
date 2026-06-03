@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(oss)* OSS backend goes functional. `/dev/dsp` is opened directly via
+  the Linux kernel UAPI (`<sys/soundcard.h>`); userspace surface is
+  `open`/`close`/`write`/`ioctl` reached through `libloading` against
+  `libc.so.6` / `libc.so` / `libc.musl-x86_64.so.1` so the produced
+  binary still has no audio library in its NEEDED list. Format
+  negotiation goes through `SNDCTL_DSP_SETFMT` (AFMT_S16_LE — the one
+  format every OSS-emulator on top of ALSA advertises),
+  `SNDCTL_DSP_CHANNELS`, and `SNDCTL_DSP_SPEED`; the worker thread
+  converts the public f32 callback samples to S16_LE before each
+  `write(2)`. `Stream::pause` skips the user callback and writes silence
+  (OSS has no soft-cork); `Stream::stop` issues `SNDCTL_DSP_RESET` to
+  drop the tail buffer rather than blocking on drain. `Stream::latency`
+  reports the worker-side period buffering
+  (`period_frames / sample_rate`); hardware-side delay via
+  `SNDCTL_DSP_GETODELAY` is a follow-up. Per-device routing falls out
+  of OSS's naming convention: `StreamRequest::with_device("/dev/dsp1")`
+  binds the stream to an alternate character device. The ioctl request
+  numbers are computed at const time via a local `_IOC(dir, type, nr,
+  size)` packing function so the values are derived from the kernel
+  ABI macro rather than transcribed hex; unit tests then assert the
+  derivation against the documented `_IOWR('P', N, int)` results
+  (0xC0045002 / 0xC0045005 / 0xC0045006 for SPEED / SETFMT /
+  CHANNELS). OSS stays last in the Linux probe order — every modern
+  distro's `/dev/dsp` is an emulator on top of ALSA, so opening ALSA
+  directly bypasses one level of indirection when both are present.
+  Closes the long-standing OSS-stub non-goal.
 - *(alsa)* `preferred_format` now wired. A throwaway `snd_pcm_open` in
   `NONBLOCK` mode + `snd_pcm_hw_params_any` loads the device's full
   hw_params space, then `snd_pcm_hw_params_set_rate_near(48000)` and

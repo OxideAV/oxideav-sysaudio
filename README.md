@@ -14,7 +14,7 @@ audio SDK is installed.
 | Linux   | PipeWire  | Stub        | `libpipewire-0.3.so.0` (not yet wired)                                        |
 | Linux   | PulseAudio| Functional  | `libpulse-simple.so.0`                                                        |
 | Linux   | ALSA      | Functional  | `libasound.so.2`                                                              |
-| Linux   | OSS       | Stub        | `/dev/dsp` (not yet wired)                                                    |
+| Linux   | OSS       | Functional  | `/dev/dsp` via dlopen'd libc (`open`/`close`/`write`/`ioctl`)                 |
 | Windows | WASAPI    | Functional  | `ole32.dll` + `kernel32.dll` (COM vtables invoked by hand, shared-mode)       |
 | Windows | ASIO      | Stub        | Vendor-supplied DLLs under `HKLM\SOFTWARE\ASIO` (not yet wired)               |
 | macOS   | CoreAudio | Functional  | `AudioToolbox.framework` (AudioQueue API)                                     |
@@ -27,7 +27,10 @@ whose dummy-open succeeds, in the documented preference order:
 - macOS: CoreAudio
 
 Stubbed backends fail `probe()` cleanly so auto-selection falls through
-to the next working backend.
+to the next working backend. OSS is last in the Linux preference order
+because on modern distros `/dev/dsp` is supplied by an OSS-emulator
+sitting on top of ALSA — when ALSA itself is present, opening it
+directly bypasses one level of indirection.
 
 ## Usage
 
@@ -92,6 +95,7 @@ network PulseAudio, HDMI passthrough, etc.):
 | --------- | ---------------------------------------------------------------------------------- | ---------------- |
 | PulseAudio| `pa_simple_get_latency` (end-to-end, server-side)                                  | Yes              |
 | ALSA      | `snd_pcm_delay` (driver queue depth)                                               | Partial          |
+| OSS       | Worker-side period buffering (`period_frames / sample_rate`)                       | No               |
 | WASAPI    | Live `IAudioClock::GetPosition` vs. frames-written delta (end-to-end, includes the device hardware pipeline). Falls back to `GetStreamLatency` + live `GetCurrentPadding` if the driver shim doesn't implement `IAudioClock`. | Yes              |
 | CoreAudio | `num_buffers × period` + HAL (`kAudioDevicePropertyLatency` + buffer frame size + safety offset + stream latency) | Yes              |
 
@@ -127,6 +131,7 @@ for dev in d.output_devices()? {
 | Backend   | Per-device routing                                                              |
 | --------- | ------------------------------------------------------------------------------- |
 | ALSA      | `id` is the PCM name; passed straight to `snd_pcm_open`.                        |
+| OSS       | `id` is the character-device path (e.g. `/dev/dsp1`, `/dev/dsp_hw0`); `None` opens `/dev/dsp`. |
 | PulseAudio| `id` is a sink name; passed as the `dev` arg of `pa_simple_new`.                |
 | WASAPI    | `id` is the LPWSTR endpoint id; resolved via `IMMDeviceEnumerator::GetDevice`.  |
 | CoreAudio | `id` is the decimal `AudioDeviceID`; HAL `kAudioDevicePropertyDeviceUID` yields the CFString, then `AudioQueueSetProperty(kAudioQueueProperty_CurrentDevice, &cfstr)` binds the queue. `latency()` follows the bound device. |
@@ -148,6 +153,7 @@ board).
 | Backend   | Per-backend routing of `buffer_frames`                                                                                  |
 | --------- | ----------------------------------------------------------------------------------------------------------------------- |
 | ALSA      | `snd_pcm_hw_params_set_period_size_near` with the hint; buffer set to `4 × period`.                                     |
+| OSS       | Worker write size = the hint; OSS has no separate period ioctl in the historic UAPI surface, so the per-`write` size IS the period. `None` keeps the historical ~20 ms target (`sample_rate / 50`, floored at 64 frames). |
 | PulseAudio| Filled into a `pa_buffer_attr` (`tlength = frames × bytes_per_frame`, `minreq` ≈ one period and capped at `tlength`); other fields stay `(uint32_t)-1`. Worker write size follows the hint so client and server stay aligned. |
 | WASAPI    | Translated to `REFERENCE_TIME` (100 ns ticks) via `frames × 10_000_000 / sample_rate` with i128 widening; passed as `hnsBufferDuration` to `IAudioClient::Initialize`. WASAPI clamps below the device's minimum period. |
 | CoreAudio | `kAudioQueueProperty_NumberOfBuffers` × buffer size derived from the hint.                                              |
@@ -175,7 +181,7 @@ if let Some(fmt) = d.preferred_format(None)? {
 | WASAPI    | `IAudioClient::GetMixFormat` (the shared-mode mix engine's preferred format — typically 48 kHz f32 stereo on Windows-10/11). |
 | CoreAudio | HAL `kAudioDevicePropertyNominalSampleRate` for the rate + `kAudioStreamPropertyVirtualFormat` on the device's first output stream for the channel count. Aggregate devices stay coherent (per-stream rates may disagree). |
 | ALSA      | Throwaway `snd_pcm_open` in `NONBLOCK` mode + `snd_pcm_hw_params_any` to load the device's full param space, then `snd_pcm_hw_params_set_rate_near(48000)` and `snd_pcm_hw_params_set_channels_near(2)` to read the snapped values out of their mutable args — the same path the real `open()` walks. The PCM is closed before the call returns. |
-| Others    | `Ok(None)` — PulseAudio simple API exposes no sink introspection; PipeWire/OSS/ASIO are stubs. |
+| Others    | `Ok(None)` — PulseAudio simple API exposes no sink introspection; OSS's `SNDCTL_DSP_*` family is in-band (committing the values to the device) so there's no read-without-write path; PipeWire/ASIO are stubs. |
 
 A backend without an introspection path surfaces as `Ok(None)` rather
 than an error so callers can iterate every probed driver without
