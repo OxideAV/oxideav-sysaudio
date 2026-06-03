@@ -174,7 +174,8 @@ if let Some(fmt) = d.preferred_format(None)? {
 | --------- | -------------------------------------------------------------------------------------------------------------------------- |
 | WASAPI    | `IAudioClient::GetMixFormat` (the shared-mode mix engine's preferred format — typically 48 kHz f32 stereo on Windows-10/11). |
 | CoreAudio | HAL `kAudioDevicePropertyNominalSampleRate` for the rate + `kAudioStreamPropertyVirtualFormat` on the device's first output stream for the channel count. Aggregate devices stay coherent (per-stream rates may disagree). |
-| Others    | `Ok(None)` — PulseAudio simple API exposes no sink introspection; ALSA's hw_params negotiation is in-band so we'd need a throwaway open to read it; PipeWire/OSS/ASIO are stubs. |
+| ALSA      | Throwaway `snd_pcm_open` in `NONBLOCK` mode + `snd_pcm_hw_params_any` to load the device's full param space, then `snd_pcm_hw_params_set_rate_near(48000)` and `snd_pcm_hw_params_set_channels_near(2)` to read the snapped values out of their mutable args — the same path the real `open()` walks. The PCM is closed before the call returns. |
+| Others    | `Ok(None)` — PulseAudio simple API exposes no sink introspection; PipeWire/OSS/ASIO are stubs. |
 
 A backend without an introspection path surfaces as `Ok(None)` rather
 than an error so callers can iterate every probed driver without

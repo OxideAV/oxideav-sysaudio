@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(alsa)* `preferred_format` now wired. A throwaway `snd_pcm_open` in
+  `NONBLOCK` mode + `snd_pcm_hw_params_any` loads the device's full
+  hw_params space, then `snd_pcm_hw_params_set_rate_near(48000)` and
+  the newly-resolved `snd_pcm_hw_params_set_channels_near(2)` write the
+  device's snapped rate / channel count back through their mutable args
+  — exactly the same path the real `open()` walks, just without
+  committing the params or starting the worker. The PCM is closed
+  before the call returns so a follow-up real `open()` against the same
+  device doesn't contend with the probe. Old libasound that lacks
+  `set_channels_near` degrades to "channels = 2" rather than erroring
+  the load (consistent with the existing degradation pattern for the
+  hint API). Closes the previous ALSA gap in the sample-rate
+  negotiation read-back table.
 - *(api)* sample-rate negotiation read-back via
   `Driver::preferred_format(Option<&Device>) -> Result<Option<StreamFormat>>`.
   Returns the rate / channels / format the backend would settle on for an

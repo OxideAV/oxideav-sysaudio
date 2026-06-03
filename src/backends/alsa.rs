@@ -101,6 +101,11 @@ type Fn_hw_params_set_channels = unsafe extern "C" fn(
     params: *mut snd_pcm_hw_params_t,
     val: c_uint,
 ) -> c_int;
+type Fn_hw_params_set_channels_near = unsafe extern "C" fn(
+    pcm: *mut snd_pcm_t,
+    params: *mut snd_pcm_hw_params_t,
+    val: *mut c_uint,
+) -> c_int;
 type Fn_hw_params_set_rate_near = unsafe extern "C" fn(
     pcm: *mut snd_pcm_t,
     params: *mut snd_pcm_hw_params_t,
@@ -160,6 +165,12 @@ struct AlsaLib {
     hw_params_set_access: Fn_hw_params_set_access,
     hw_params_set_format: Fn_hw_params_set_format,
     hw_params_set_channels: Fn_hw_params_set_channels,
+    /// Channel-count negotiation analogue of `set_rate_near` — clamps
+    /// the requested count into the device's supported range and writes
+    /// the snapped value back through the mutable arg. Optional so a
+    /// libasound old enough to lack it just degrades `preferred_format`
+    /// to "no channel-count hint" rather than failing the whole load.
+    hw_params_set_channels_near: Option<Fn_hw_params_set_channels_near>,
     hw_params_set_rate_near: Fn_hw_params_set_rate_near,
     hw_params_set_period_size_near: Fn_hw_params_set_period_size_near,
     hw_params_set_buffer_size_near: Fn_hw_params_set_buffer_size_near,
@@ -236,6 +247,11 @@ impl AlsaLib {
             let hw_params_set_format = sym!(snd_pcm_hw_params_set_format, Fn_hw_params_set_format);
             let hw_params_set_channels =
                 sym!(snd_pcm_hw_params_set_channels, Fn_hw_params_set_channels);
+            // Optional — degrades `preferred_format` only.
+            let hw_params_set_channels_near = opt_sym!(
+                snd_pcm_hw_params_set_channels_near,
+                Fn_hw_params_set_channels_near
+            );
             let hw_params_set_rate_near =
                 sym!(snd_pcm_hw_params_set_rate_near, Fn_hw_params_set_rate_near);
             let hw_params_set_period_size_near = sym!(
@@ -274,6 +290,7 @@ impl AlsaLib {
                 hw_params_set_access,
                 hw_params_set_format,
                 hw_params_set_channels,
+                hw_params_set_channels_near,
                 hw_params_set_rate_near,
                 hw_params_set_period_size_near,
                 hw_params_set_buffer_size_near,
@@ -462,6 +479,121 @@ impl Backend for AlsaBackend {
     fn output_devices(&self) -> Result<Vec<Device>> {
         lib()?.enumerate()
     }
+
+    /// Throwaway-open + `hw_params_any` to read what the device would
+    /// pick for an unconstrained request. ALSA's hw_params negotiation
+    /// is in-band so this is the only way to surface the device's
+    /// preferred rate / channel count without holding a stream open.
+    /// We feed a canonical 48 kHz / 2 ch hint into the `_near` helpers
+    /// and read the snapped values back out of their mutable args —
+    /// exactly the path `open()` uses to land on the actual stream
+    /// rate, just without committing the params or starting the
+    /// worker. The PCM is closed before we return so the caller can
+    /// follow up with a real `open()` against the same device without
+    /// contention.
+    fn preferred_format(&self, device_id: Option<&str>) -> Result<StreamFormat> {
+        let l = lib()?;
+        let pcm_name = device_id.unwrap_or("default");
+        let name = CString::new(pcm_name).map_err(|_| Error::DeviceOpen {
+            backend: "alsa",
+            detail: "device id contains an interior NUL byte".into(),
+        })?;
+        unsafe {
+            let mut pcm: *mut snd_pcm_t = ptr::null_mut();
+            // NONBLOCK so a busy device doesn't make `preferred_format`
+            // wait for it — we just want to read the param-space
+            // metadata, not drive samples.
+            let r = (l.snd_pcm_open)(
+                &mut pcm,
+                name.as_ptr(),
+                SND_PCM_STREAM_PLAYBACK,
+                SND_PCM_NONBLOCK,
+            );
+            if r < 0 {
+                return Err(Error::DeviceOpen {
+                    backend: "alsa",
+                    detail: l.strerror(r),
+                });
+            }
+            // From here on we must close `pcm` on every exit path.
+            let res = preferred_format_inner(&l, pcm);
+            (l.snd_pcm_close)(pcm);
+            res
+        }
+    }
+}
+
+/// Inner helper for `preferred_format`. Assumes `pcm` is an open PCM
+/// handle; the caller is responsible for closing it. Uses a local RAII
+/// guard for the hw_params allocation so every error path releases it
+/// before unwinding to `preferred_format`'s `snd_pcm_close`.
+unsafe fn preferred_format_inner(l: &AlsaLib, pcm: *mut snd_pcm_t) -> Result<StreamFormat> {
+    struct LocalHwGuard<'a> {
+        l: &'a AlsaLib,
+        hw: *mut snd_pcm_hw_params_t,
+    }
+    impl<'a> Drop for LocalHwGuard<'a> {
+        fn drop(&mut self) {
+            unsafe { (self.l.hw_params_free)(self.hw) };
+        }
+    }
+
+    let mut hw: *mut snd_pcm_hw_params_t = ptr::null_mut();
+    let r = (l.hw_params_malloc)(&mut hw);
+    if r < 0 {
+        return Err(Error::DeviceOpen {
+            backend: "alsa",
+            detail: format!("hw_params_malloc: {}", l.strerror(r)),
+        });
+    }
+    let _guard = LocalHwGuard { l, hw };
+
+    // Load the full parameter superset for the device.
+    check(l, (l.hw_params_any)(pcm, hw), "hw_params_any")?;
+    // Sample format — mirror the open path's preference (FLOAT_LE, fall
+    // back to S16_LE). The public callback surface stays F32 either way;
+    // the open path silently converts S16<->F32 for old devices. So the
+    // *reported* format here is always F32 — what we're really probing
+    // for is whether the device will accept the open path at all.
+    let format = if (l.hw_params_set_format)(pcm, hw, SND_PCM_FORMAT_FLOAT_LE) == 0 {
+        SampleFormat::F32
+    } else {
+        check(
+            l,
+            (l.hw_params_set_format)(pcm, hw, SND_PCM_FORMAT_S16_LE),
+            "hw_params_set_format(S16_LE)",
+        )?;
+        SampleFormat::F32
+    };
+    // Channel-count snap — canonical 2 (stereo) hint, let ALSA pull it
+    // into the device's nearest supported count. The symbol is
+    // optional; if libasound is old enough to lack it we keep 2 as the
+    // documented default. Stereo is the common reality and matches the
+    // backend's other clamping (`channels.clamp(1, 8)` on `open`).
+    let mut channels: c_uint = 2;
+    if let Some(set_near) = l.hw_params_set_channels_near {
+        check(
+            l,
+            set_near(pcm, hw, &mut channels),
+            "hw_params_set_channels_near",
+        )?;
+    }
+    // Sample-rate snap — canonical 48 kHz hint, exactly the path the
+    // open() comment in lib.rs documents:
+    // "the rate `snd_pcm_hw_params_set_rate_near` snaps the
+    //  unconstrained request to".
+    let mut rate: c_uint = 48_000;
+    let mut dir: c_int = 0;
+    check(
+        l,
+        (l.hw_params_set_rate_near)(pcm, hw, &mut rate, &mut dir),
+        "hw_params_set_rate_near",
+    )?;
+    Ok(StreamFormat {
+        sample_rate: rate,
+        channels: channels.clamp(1, u16::MAX as c_uint) as u16,
+        format,
+    })
 }
 
 unsafe fn open_inner(
