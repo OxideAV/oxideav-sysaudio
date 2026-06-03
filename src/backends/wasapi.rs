@@ -536,6 +536,47 @@ impl Backend for WasapiBackend {
         let l = lib()?;
         unsafe { enumerate_output_devices(&l) }
     }
+
+    /// The WASAPI mix engine's preferred format for the requested endpoint,
+    /// read straight from `IAudioClient::GetMixFormat`. That's the rate /
+    /// channel count / sample width the engine will accept in shared mode
+    /// without invoking its built-in software conversion — typically
+    /// 48 kHz f32 stereo on Windows-10/11 hardware, sometimes 44.1 kHz on
+    /// older boards. We `Initialize` nothing, so the call has no side
+    /// effect on other streams open against the same endpoint.
+    fn preferred_format(&self, device_id: Option<&str>) -> Result<StreamFormat> {
+        let l = lib()?;
+        unsafe {
+            co_init(&l);
+            let result = (|| {
+                let (client, pwfx) = activate_client(&l, device_id)?;
+                let channels = (*pwfx).nChannels;
+                let sample_rate = (*pwfx).nSamplesPerSec;
+                let inspected = inspect_format(pwfx);
+                (l.CoTaskMemFree)(pwfx as *mut c_void);
+                com_release(client);
+                let (is_float, bits) = inspected.ok_or(Error::UnsupportedFormat {
+                    backend: "wasapi",
+                    detail: "mix format is neither IEEE_FLOAT nor PCM".into(),
+                })?;
+                // The public `SampleFormat` enum currently only spells
+                // f32; an S16 mix engine is still played through the
+                // crate (the open path converts), but the *preferred*
+                // format report names what we'd hand the callback, which
+                // is always f32 interleaved. The (is_float, bits) pair
+                // is consumed only to validate the engine is one we
+                // understand at all.
+                let _ = (is_float, bits);
+                Ok(StreamFormat {
+                    sample_rate,
+                    channels,
+                    format: SampleFormat::F32,
+                })
+            })();
+            (l.CoUninitialize)();
+            result
+        }
+    }
 }
 
 /// Copy a NUL-terminated UTF-16 (`LPWSTR`) into an owned `String`.

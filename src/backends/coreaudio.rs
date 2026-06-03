@@ -289,6 +289,22 @@ const kAudioDevicePropertyDeviceUID: u32 = four_cc(b"uid ");
 // `AudioQueueStart` so the queue never plays through the wrong endpoint.
 const kAudioQueueProperty_CurrentDevice: u32 = four_cc(b"aqcd");
 
+// Device-side sample-rate negotiation read-back. The HAL exposes the rate the
+// device is currently running at (= the rate AudioQueue's mixer will
+// resample into when our ASBD specifies a different one) as a single f64
+// under `kAudioDevicePropertyNominalSampleRate` ('nsrt' per
+// AudioHardwareBase.h). Reporting this through `preferred_format()` lets a
+// caller resample once on their side and skip the queue's hidden conversion.
+const kAudioDevicePropertyNominalSampleRate: u32 = four_cc(b"nsrt");
+
+// Per-stream effective format on the device's first output stream.
+// `AudioStream.h` documents 'sfmt' as an `AudioStreamBasicDescription` value
+// — i.e. exactly the shape we already use for `AudioQueueNewOutput`. We read
+// it to pick up the device's current channel count (the rate is also there
+// but `NominalSampleRate` is the right answer on aggregate devices, which
+// expose multiple streams).
+const kAudioStreamPropertyVirtualFormat: u32 = four_cc(b"sfmt");
+
 /// `AudioObjectGetPropertyData(inObjectID, inAddress, 0, NULL,
 /// ioDataSize, outData)` — the getter every HAL query funnels
 /// through. The two `UInt32` args after the address are the
@@ -723,6 +739,61 @@ unsafe fn hal_device_name(ca: &CaLib, device: AudioObjectID) -> String {
     String::from_utf8_lossy(&buf[..end]).into_owned()
 }
 
+/// Query `selector` from `object` as a single `f64`. Returns `None` if the
+/// property is missing, the wrong size, or the getter fails. Used for
+/// `kAudioDevicePropertyNominalSampleRate`, whose value is a HAL-typed
+/// `Float64`.
+unsafe fn hal_get_f64(ca: &CaLib, object: AudioObjectID, selector: u32, scope: u32) -> Option<f64> {
+    let addr = AudioObjectPropertyAddress {
+        mSelector: selector,
+        mScope: scope,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let mut value: f64 = 0.0;
+    let mut size: u32 = std::mem::size_of::<f64>() as u32;
+    let r = (ca.AudioObjectGetPropertyData)(
+        object,
+        &addr,
+        0,
+        ptr::null(),
+        &mut size,
+        &mut value as *mut f64 as *mut c_void,
+    );
+    if r == 0 && size as usize == std::mem::size_of::<f64>() {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// Query `kAudioStreamPropertyVirtualFormat` for `stream` as an
+/// `AudioStreamBasicDescription`. The HAL writes the stream's current
+/// effective format — what AudioQueue would feed without invoking its
+/// own rate / channel conversion. Returns `None` if the property is
+/// missing, the wrong size, or the getter fails.
+unsafe fn hal_get_asbd(ca: &CaLib, stream: AudioObjectID) -> Option<AudioStreamBasicDescription> {
+    let addr = AudioObjectPropertyAddress {
+        mSelector: kAudioStreamPropertyVirtualFormat,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let mut value = AudioStreamBasicDescription::default();
+    let mut size: u32 = std::mem::size_of::<AudioStreamBasicDescription>() as u32;
+    let r = (ca.AudioObjectGetPropertyData)(
+        stream,
+        &addr,
+        0,
+        ptr::null(),
+        &mut size,
+        &mut value as *mut AudioStreamBasicDescription as *mut c_void,
+    );
+    if r == 0 && size as usize == std::mem::size_of::<AudioStreamBasicDescription>() {
+        Some(value)
+    } else {
+        None
+    }
+}
+
 /// Numeric AudioDeviceID of the current default output, or 0 if the
 /// query fails.
 unsafe fn hal_default_output_device(ca: &CaLib) -> AudioObjectID {
@@ -819,6 +890,76 @@ impl Backend for CoreAudioBackend {
 
     fn output_devices(&self) -> Result<Vec<Device>> {
         enumerate_output_devices()
+    }
+
+    /// Best-effort report of the device's `NominalSampleRate` + its first
+    /// output stream's `VirtualFormat` channel count. The HAL returns the
+    /// rate the device is currently running at, which is what AudioQueue's
+    /// mixer would resample into when our ASBD specifies a different one
+    /// — so reporting it back lets the caller resample once on their side
+    /// and skip the queue's hidden conversion. `channels` is read from the
+    /// virtual format of the device's first output stream; rate from
+    /// `NominalSampleRate` on the device so aggregate devices (which expose
+    /// per-stream rates that may disagree) are reported coherently.
+    fn preferred_format(&self, device_id: Option<&str>) -> Result<StreamFormat> {
+        let ca = ca_lib().ok_or(Error::NotImplemented("coreaudio"))?;
+        unsafe {
+            let device: AudioObjectID = match device_id {
+                None => {
+                    let d = hal_default_output_device(&ca);
+                    if d == 0 {
+                        return Err(Error::DeviceOpen {
+                            backend: "coreaudio",
+                            detail: "kAudioHardwarePropertyDefaultOutputDevice query failed".into(),
+                        });
+                    }
+                    d
+                }
+                Some(id_str) => id_str.parse().map_err(|_| Error::UnsupportedFormat {
+                    backend: "coreaudio",
+                    detail: format!(
+                        "device id {id_str:?} is not a numeric AudioDeviceID (must come from \
+                         output_devices() on the same coreaudio backend)"
+                    ),
+                })?,
+            };
+            let rate = hal_get_f64(
+                &ca,
+                device,
+                kAudioDevicePropertyNominalSampleRate,
+                kAudioObjectPropertyScopeOutput,
+            )
+            .or_else(|| {
+                hal_get_f64(
+                    &ca,
+                    device,
+                    kAudioDevicePropertyNominalSampleRate,
+                    kAudioObjectPropertyScopeGlobal,
+                )
+            })
+            .ok_or(Error::UnsupportedFormat {
+                backend: "coreaudio",
+                detail: format!(
+                    "HAL has no NominalSampleRate for AudioDeviceID {device} — not an output \
+                     device or query refused"
+                ),
+            })?;
+            // Round to the nearest u32: HAL rates are advertised as exact
+            // decimals (44_100.0, 48_000.0, 96_000.0…) but the f64 path
+            // means we should still tolerate a ULP-off reading rather than
+            // truncate 47_999.9999 down to 47_999.
+            let sample_rate = rate.round().max(0.0).min(u32::MAX as f64) as u32;
+            let channels = hal_first_output_stream(&ca, device)
+                .and_then(|s| hal_get_asbd(&ca, s))
+                .map(|asbd| asbd.mChannelsPerFrame as u16)
+                .filter(|c| *c >= 1)
+                .unwrap_or(2);
+            Ok(StreamFormat {
+                sample_rate,
+                channels,
+                format: SampleFormat::F32,
+            })
+        }
     }
 }
 

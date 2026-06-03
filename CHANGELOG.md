@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(api)* sample-rate negotiation read-back via
+  `Driver::preferred_format(Option<&Device>) -> Result<Option<StreamFormat>>`.
+  Returns the rate / channels / format the backend would settle on for an
+  unconstrained `open()` against the system default (`None`) or the
+  enumerated endpoint — so callers can resample on their side once and
+  skip the OS mixer's hidden conversion. WASAPI reads
+  `IAudioClient::GetMixFormat` (= the shared-mode mix engine's
+  preferred format, typically 48 kHz f32 stereo on Windows-10/11);
+  CoreAudio reads the HAL property
+  `kAudioDevicePropertyNominalSampleRate` (`'nsrt'`) for the rate and
+  `kAudioStreamPropertyVirtualFormat` (`'sfmt'`) on the device's first
+  output stream for the channel count, so aggregate devices stay
+  coherent. Backends without an introspection path (PulseAudio simple
+  API, ALSA, the PipeWire/OSS/ASIO stubs) report `Ok(None)` so callers
+  can iterate every driver without per-backend special-casing.
 - *(wasapi, pulse)* honour `StreamRequest::buffer_frames` on every
   functional backend. WASAPI translates the hint into the
   `REFERENCE_TIME` (100 ns ticks) value `IAudioClient::Initialize`

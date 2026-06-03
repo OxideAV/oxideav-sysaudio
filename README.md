@@ -155,6 +155,31 @@ board).
 Sub-millisecond hints round up to at least one tick on WASAPI; massive
 hints saturate rather than overflow.
 
+## Sample-rate negotiation read-back
+
+`Driver::preferred_format(Option<&Device>)` reports what `open()` would
+agree on for an unconstrained request, without committing a stream.
+Callers use it to resample once on their side and skip the OS mixer's
+hidden conversion path:
+
+```rust
+let d = oxideav_sysaudio::default_driver().ok_or("no driver")?;
+if let Some(fmt) = d.preferred_format(None)? {
+    // Resample our 44.1 kHz pipeline to fmt.sample_rate before open().
+    println!("native: {} Hz, {} ch", fmt.sample_rate, fmt.channels);
+}
+```
+
+| Backend   | Source of the report                                                                                                       |
+| --------- | -------------------------------------------------------------------------------------------------------------------------- |
+| WASAPI    | `IAudioClient::GetMixFormat` (the shared-mode mix engine's preferred format — typically 48 kHz f32 stereo on Windows-10/11). |
+| CoreAudio | HAL `kAudioDevicePropertyNominalSampleRate` for the rate + `kAudioStreamPropertyVirtualFormat` on the device's first output stream for the channel count. Aggregate devices stay coherent (per-stream rates may disagree). |
+| Others    | `Ok(None)` — PulseAudio simple API exposes no sink introspection; ALSA's hw_params negotiation is in-band so we'd need a throwaway open to read it; PipeWire/OSS/ASIO are stubs. |
+
+A backend without an introspection path surfaces as `Ok(None)` rather
+than an error so callers can iterate every probed driver without
+per-backend special-casing.
+
 ## Non-goals (for now)
 
 - **Audio capture / input streams.** Output only.

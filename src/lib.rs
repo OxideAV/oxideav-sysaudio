@@ -80,6 +80,37 @@ impl Driver {
             Err(e) => Err(e),
         }
     }
+
+    /// Best-effort query of the [`StreamFormat`] this backend would settle
+    /// on if [`crate::open`] were called against `device` (or the system
+    /// default when `device` is `None`). The returned `sample_rate` is the
+    /// rate the backend would actually run at — the WASAPI mix engine's
+    /// preferred rate (often 48 kHz on Windows-10/11, sometimes 44.1 kHz
+    /// on older endpoints), the CoreAudio HAL's `NominalSampleRate`, the
+    /// rate ALSA's `snd_pcm_hw_params_set_rate_near` snaps the unconstrained
+    /// request to. Callers use it to plan resampling before
+    /// [`crate::open`] so the OS mix engine doesn't end up doing a hidden
+    /// software conversion. `channels` and `format` are similarly
+    /// best-effort.
+    ///
+    /// Returns `Ok(None)` rather than an error when the backend has no
+    /// introspection path (the PulseAudio "simple" API, the
+    /// PipeWire/OSS/ASIO stubs) — callers can union per-driver results
+    /// without per-backend special-casing.
+    ///
+    /// `device` must belong to the same `Driver` it was enumerated from;
+    /// passing a foreign id surfaces the backend's own error path
+    /// (typically [`Error::DeviceOpen`] / [`Error::UnsupportedFormat`]).
+    pub fn preferred_format(&self, device: Option<&Device>) -> Result<Option<StreamFormat>> {
+        let id = device.map(|d| d.id.as_str());
+        match self.inner.preferred_format(id) {
+            Ok(f) => Ok(Some(f)),
+            // A backend that doesn't introspect is reported as "no
+            // preferred format known", not an error — see the trait doc.
+            Err(Error::NotImplemented(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 impl std::fmt::Debug for Driver {
@@ -275,6 +306,44 @@ mod tests {
                 "{} accepted a fabricated device id; this is a routing bug",
                 d.name()
             );
+        }
+    }
+
+    #[test]
+    fn preferred_format_never_leaks_not_implemented() {
+        // Same contract as `output_devices_never_errors_with_not_implemented`:
+        // the public layer maps a backend's `NotImplemented` into `Ok(None)`,
+        // so iterating every compiled-in driver must never surface that
+        // variant. A genuine failure (library present but the introspection
+        // call errored) may surface as `Err`. The headless CI path is
+        // typically `Ok(None)` (library not loaded → backend's preferred-
+        // format returns NotImplemented or DeviceOpen depending on order).
+        for d in drivers() {
+            match d.preferred_format(None) {
+                Ok(_) => {}
+                Err(Error::NotImplemented(b)) => {
+                    panic!("preferred_format leaked NotImplemented for {b}")
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    #[test]
+    fn preferred_format_with_alien_id_does_not_panic() {
+        // Same dispatch sanity check as `open_on_with_alien_id_fails_cleanly`:
+        // a fabricated id must be reported via the result, never via a
+        // panic, and never via a fabricated `Some(StreamFormat)` for a
+        // device that doesn't exist. On a headless CI box every backend
+        // typically returns `Ok(None)` (library not loaded) or an `Err`
+        // (library loaded but the id didn't resolve); both are fine.
+        for d in drivers() {
+            let alien = Device {
+                id: "definitely-not-a-real-device-id-on-any-backend".into(),
+                name: "fake".into(),
+                is_default: false,
+            };
+            let _ = d.preferred_format(Some(&alien));
         }
     }
 
