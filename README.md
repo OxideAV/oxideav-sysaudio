@@ -84,6 +84,22 @@ Backends that can only reach the default device (the PulseAudio
 an **empty list** rather than an error, so a caller can union device
 lists across every probed driver without per-backend special-casing.
 
+`Driver::default_output_device()` is the one-call shortcut for the
+common "where does the system play right now?" query — it returns the
+entry from the enumeration whose `is_default` is set, without forcing
+the caller to materialise the full list and filter:
+
+```rust
+let d = oxideav_sysaudio::default_driver().ok_or("no driver")?;
+if let Some(dev) = d.default_output_device()? {
+    println!("default sink: {} [{}]", dev.name, dev.id);
+}
+```
+
+Backends without an enumeration path (PulseAudio simple API, stubs)
+surface `Ok(None)` rather than an error, matching `output_devices()`
+so an iterating caller can union per-driver results.
+
 ## Latency reporting
 
 `Stream::latency()` returns an `Option<Duration>` describing how long a

@@ -31,6 +31,32 @@ pub(crate) trait Backend: Sync {
         Err(Error::NotImplemented(self.name()))
     }
 
+    /// Best-effort report of the device a plain `open()` (with no
+    /// `with_device`) would currently bind to — the system's default
+    /// output endpoint. The base implementation is a thin reduction over
+    /// [`Backend::output_devices`]: take the one entry whose
+    /// [`Device::is_default`] is set. Backends that have a cheaper
+    /// direct-query path (e.g. CoreAudio's
+    /// `kAudioHardwarePropertyDefaultOutputDevice` system-object
+    /// selector, WASAPI's `IMMDeviceEnumerator::GetDefaultAudioEndpoint`)
+    /// may override this with the direct call later; the reduction is
+    /// the always-correct fallback because every backend that enumerates
+    /// already tags the default entry.
+    ///
+    /// Returns `Err(Error::NotImplemented(_))` when the backend has no
+    /// enumeration path at all (the PulseAudio "simple" API + the
+    /// not-yet-wired stubs); the public layer maps that into `Ok(None)`
+    /// so a caller can union per-driver results without per-backend
+    /// special-casing. Returns `Ok(None)` from an enumerating backend
+    /// when the list is empty (no playback devices currently visible to
+    /// the OS — unplugged USB DAC, no built-in speakers on a headless VM)
+    /// or no entry is flagged as default (the OS itself reports no
+    /// default endpoint, which can happen between hotplug events on
+    /// CoreAudio).
+    fn default_output_device(&self) -> Result<Option<Device>> {
+        Ok(self.output_devices()?.into_iter().find(|d| d.is_default))
+    }
+
     /// Best-effort query of what `open()` would actually agree on for the
     /// system default (`device_id == None`) or the named endpoint, without
     /// committing a live stream. Returned `sample_rate` is what the

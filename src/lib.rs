@@ -81,6 +81,37 @@ impl Driver {
         }
     }
 
+    /// The single playback device a plain [`crate::open`] (with no
+    /// `with_device`) would bind to — the system's default output
+    /// endpoint. Equivalent to scanning [`Driver::output_devices`] for
+    /// the entry whose [`Device::is_default`] flag is set, but exposed
+    /// as a one-call shortcut so a caller only interested in "where does
+    /// the system play right now?" doesn't have to materialise the full
+    /// device list and filter.
+    ///
+    /// Returns `Ok(None)` rather than an error when the backend has no
+    /// enumeration path at all (the PulseAudio "simple" API and the
+    /// not-yet-wired PipeWire/OSS/ASIO stubs), so callers can union
+    /// per-driver results without per-backend special-casing. Also
+    /// returns `Ok(None)` from an enumerating backend when no device is
+    /// currently flagged as default — the list was empty (no playback
+    /// hardware visible to the OS) or the OS itself reports no default
+    /// endpoint (a transient state on CoreAudio between hotplug events).
+    ///
+    /// The `id` in the returned [`Device`] is the same backend-native
+    /// opaque token [`Driver::output_devices`] uses, suitable for
+    /// feeding back into [`crate::StreamRequest::with_device`] /
+    /// [`crate::open_on`].
+    pub fn default_output_device(&self) -> Result<Option<Device>> {
+        match self.inner.default_output_device() {
+            Ok(v) => Ok(v),
+            // A backend that doesn't enumerate is reported as "no
+            // default device known", not an error — see the trait doc.
+            Err(Error::NotImplemented(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Best-effort query of the [`StreamFormat`] this backend would settle
     /// on if [`crate::open`] were called against `device` (or the system
     /// default when `device` is `None`). The returned `sample_rate` is the
@@ -344,6 +375,77 @@ mod tests {
                 is_default: false,
             };
             let _ = d.preferred_format(Some(&alien));
+        }
+    }
+
+    #[test]
+    fn default_output_device_never_leaks_not_implemented() {
+        // Mirrors `output_devices_never_errors_with_not_implemented`: the
+        // public layer maps a backend's `NotImplemented` into `Ok(None)`,
+        // so iterating every compiled-in driver must never surface that
+        // variant. A genuine runtime failure (library present but the
+        // enumeration call errored) may surface as `Err`. The headless
+        // CI path is typically `Ok(None)` (library not loaded → backend's
+        // `output_devices()` returns `LibraryLoad`, which the trait
+        // default of `default_output_device()` forwards verbatim).
+        for d in drivers() {
+            match d.default_output_device() {
+                Ok(_) => {}
+                Err(Error::NotImplemented(b)) => {
+                    panic!("default_output_device leaked NotImplemented for {b}")
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    #[test]
+    fn default_output_device_matches_enumeration() {
+        // The two paths must agree about which entry is the default,
+        // because the public-API contract advertises the one-call
+        // shortcut as exactly "the entry from `output_devices()` whose
+        // `is_default` is set". A divergence is a contract bug.
+        //
+        // On a headless CI box both paths typically return empty / None,
+        // which trivially satisfies the cross-check; the invariant
+        // matters on real hardware and is cheap to assert unconditionally
+        // here.
+        for d in drivers() {
+            // Skip drivers that surface a backend error from either
+            // side — those paths already have their own coverage and
+            // we don't want to conflate "OS refused the call" with
+            // "the two accessors disagree".
+            let (Ok(default), Ok(list)) = (d.default_output_device(), d.output_devices()) else {
+                continue;
+            };
+            let from_list = list.into_iter().find(|x| x.is_default);
+            assert_eq!(
+                default,
+                from_list,
+                "{}: default_output_device() disagrees with the is_default entry from \
+                 output_devices()",
+                d.name()
+            );
+        }
+    }
+
+    #[test]
+    fn default_output_device_carries_is_default_flag() {
+        // Whatever a backend returns from `default_output_device()`,
+        // a `Some(_)` entry must carry `is_default == true` — otherwise
+        // a caller plumbing the returned `Device` into a UI tag would
+        // mislabel it. (On a headless CI box every backend typically
+        // returns `Ok(None)`, which trivially satisfies this; the
+        // invariant matters on a real machine and is cheap to assert
+        // unconditionally.)
+        for d in drivers() {
+            if let Ok(Some(dev)) = d.default_output_device() {
+                assert!(
+                    dev.is_default,
+                    "{}: default_output_device() returned an entry with is_default == false",
+                    d.name()
+                );
+            }
         }
     }
 

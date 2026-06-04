@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(api)* `Driver::default_output_device() -> Result<Option<Device>>` —
+  one-call shortcut for "the entry from `output_devices()` whose
+  `is_default` flag is set", so a caller only interested in the current
+  default endpoint doesn't have to materialise the full device list and
+  filter. The default implementation on the internal `Backend` trait is
+  exactly that reduction (every enumerating backend already tags the
+  default entry), with room for backends to swap in a cheaper direct
+  query later (CoreAudio's `kAudioHardwarePropertyDefaultOutputDevice`
+  system-object selector, WASAPI's
+  `IMMDeviceEnumerator::GetDefaultAudioEndpoint`). Public-layer mapping
+  matches the rest of the surface: backends without an enumeration path
+  (PulseAudio "simple" API, the not-yet-wired PipeWire/OSS/ASIO stubs)
+  surface `Ok(None)` rather than an error so a caller can union
+  per-driver results without per-backend special-casing. Three new unit
+  tests pin the contract: `NotImplemented` is never leaked to the
+  public surface, the shortcut agrees with the `is_default` entry from
+  the enumeration (cross-check), and a `Some(_)` return always carries
+  `is_default == true` (so a UI caller plumbing the returned `Device`
+  into a label never mislabels it).
 - *(oss)* OSS backend goes functional. `/dev/dsp` is opened directly via
   the Linux kernel UAPI (`<sys/soundcard.h>`); userspace surface is
   `open`/`close`/`write`/`ioctl` reached through `libloading` against
