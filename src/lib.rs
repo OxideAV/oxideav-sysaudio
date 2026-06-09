@@ -59,6 +59,33 @@ impl Driver {
         self.inner.description()
     }
 
+    /// `true` when this backend is compiled in as a placeholder rather
+    /// than a working implementation — currently PipeWire on Linux and
+    /// ASIO on Windows, both tracked as follow-ups in the README. Every
+    /// call into a stub backend ([`Driver::output_devices`],
+    /// [`crate::open`], …) fails with the `NotImplemented` family of
+    /// errors regardless of host configuration. Functional backends
+    /// return `false`.
+    ///
+    /// Useful for callers iterating [`drivers()`] (which includes stubs)
+    /// who want to surface "PipeWire — not yet implemented" in a UI
+    /// distinctly from "ALSA — library not installed on this host". The
+    /// latter shows up in [`drivers()`] but not in [`probe()`]; the
+    /// former shows up in [`drivers()`] but cannot be told apart from a
+    /// missing library by [`probe()`] alone (both fail the probe). This
+    /// accessor closes that gap with a compile-time bit on each
+    /// backend, independent of probe outcome.
+    ///
+    /// ```no_run
+    /// for d in oxideav_sysaudio::drivers() {
+    ///     let tag = if d.is_stub() { " (stub)" } else { "" };
+    ///     println!("{}: {}{tag}", d.name(), d.description());
+    /// }
+    /// ```
+    pub fn is_stub(&self) -> bool {
+        self.inner.is_stub()
+    }
+
     /// Enumerate this backend's playback (output) devices, each tagged
     /// with whether it is the system default. The list is in the
     /// backend's natural order; exactly one entry has
@@ -446,6 +473,59 @@ mod tests {
                     d.name()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn is_stub_marks_only_pipewire_and_asio() {
+        // Compile-time stub flag: PipeWire and ASIO are the two backends
+        // that ship as placeholders (per README); everything else is
+        // functional. The accessor must agree with that contract on
+        // whichever target_os this CI runner is — we can't assert on
+        // backends that aren't compiled in.
+        for d in drivers() {
+            let expected = matches!(d.name(), "pipewire" | "asio");
+            assert_eq!(
+                d.is_stub(),
+                expected,
+                "{}: is_stub() = {}, expected {}",
+                d.name(),
+                d.is_stub(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn is_stub_implies_probe_fails() {
+        // The whole point of the stub flag is that the backend is
+        // guaranteed-broken at runtime regardless of host configuration.
+        // A stub that somehow passes `probe()` would mislead a caller
+        // that's using `is_stub()` to skip stubs in a UI.
+        for d in drivers() {
+            if d.is_stub() {
+                let stub_passed_probe = probe().iter().any(|p| std::ptr::eq(p.inner, d.inner));
+                assert!(
+                    !stub_passed_probe,
+                    "{}: is_stub() == true but probe() accepted it",
+                    d.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn is_stub_disjoint_from_probe_results() {
+        // Symmetric form of the above: nothing in `probe()`'s output
+        // should be a stub. Catches the same bug from the other
+        // direction, plus regressions where a future functional backend
+        // accidentally inherits the trait default (or vice versa).
+        for d in probe() {
+            assert!(
+                !d.is_stub(),
+                "{}: appears in probe() yet is_stub() returns true",
+                d.name()
+            );
         }
     }
 

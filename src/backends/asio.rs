@@ -19,6 +19,9 @@ impl Backend for AsioBackend {
     fn description(&self) -> &'static str {
         "ASIO (stub — not yet implemented)"
     }
+    fn is_stub(&self) -> bool {
+        true
+    }
     fn probe(&self) -> Result<()> {
         Err(Error::NotImplemented("asio"))
     }

@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(api)* `Driver::is_stub() -> bool` — compile-time capability flag
+  distinguishing backends that ship as placeholders (PipeWire on Linux,
+  ASIO on Windows) from working backends whose shared library may or
+  may not be installed on the current host. Both cases look identical
+  through `probe()` alone (it fails for either reason); the new
+  accessor closes the gap with a dedicated bit on the internal
+  `Backend` trait, defaulting to `false` and overridden to `true` in
+  the two stub modules. Useful for callers iterating `drivers()`
+  (which includes stubs) to surface a per-backend UI label that
+  distinguishes "not yet implemented" from "library not installed".
+  Three unit tests pin the contract: the flag matches the documented
+  set (only `pipewire` / `asio`), every stub fails `probe()` (the
+  whole point of the flag), and nothing in `probe()`'s output is a
+  stub (symmetric form catches the reverse regression).
 - *(api)* `Driver::default_output_device() -> Result<Option<Device>>` —
   one-call shortcut for "the entry from `output_devices()` whose
   `is_default` flag is set", so a caller only interested in the current

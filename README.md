@@ -32,6 +32,20 @@ because on modern distros `/dev/dsp` is supplied by an OSS-emulator
 sitting on top of ALSA — when ALSA itself is present, opening it
 directly bypasses one level of indirection.
 
+`Driver::is_stub()` reports whether a backend ships as a placeholder
+(PipeWire, ASIO) versus a working implementation whose shared library
+may or may not be installed on this host. The two cases look identical
+through `probe()` alone — both fail — so callers iterating `drivers()`
+to surface a per-backend UI label can use the compile-time flag to tell
+"not yet implemented" apart from "library not installed":
+
+```rust
+for d in oxideav_sysaudio::drivers() {
+    let tag = if d.is_stub() { " (stub)" } else { "" };
+    println!("{}: {}{tag}", d.name(), d.description());
+}
+```
+
 ## Usage
 
 ```rust

@@ -11,6 +11,17 @@ pub(crate) trait Backend: Sync {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
 
+    /// Compile-time capability flag: `true` for backends whose
+    /// implementation is still a placeholder (PipeWire, ASIO) — every
+    /// call into them will fail with [`Error::NotImplemented`] regardless
+    /// of host configuration. Default `false` for the functional
+    /// backends. Used by [`crate::Driver::is_stub`] so callers can
+    /// distinguish "backend not implemented yet" from "backend
+    /// implemented but the shared library isn't installed on this host".
+    fn is_stub(&self) -> bool {
+        false
+    }
+
     /// Cheap check that this backend is usable right now: loads the
     /// shared library and opens a throw-away handle. Errors are
     /// swallowed by `probe()`; they don't bubble to the user.
