@@ -226,3 +226,7 @@ per-backend special-casing.
 - **Sample formats other than f32** on the public callback surface.
   Backends convert internally where the hardware insists on S16 or
   similar.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
