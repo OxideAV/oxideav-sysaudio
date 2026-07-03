@@ -1,5 +1,7 @@
 # oxideav-sysaudio
 
+[![CI](https://github.com/OxideAV/oxideav-sysaudio/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-sysaudio/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-sysaudio.svg)](https://crates.io/crates/oxideav-sysaudio) [![docs.rs](https://docs.rs/oxideav-sysaudio/badge.svg)](https://docs.rs/oxideav-sysaudio) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust audio output for the `oxideav` workspace. Every native audio
 API is loaded at runtime through `libloading`, so the produced binary
 has **no** audio library listed in its ELF `NEEDED` entries (or the
