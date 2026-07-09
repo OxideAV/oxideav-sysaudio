@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(api)* `Driver::status() -> DriverStatus` — one-call availability
+  triage collapsing the three existing signals into a tri-state:
+  `Ready` (probe succeeds; exactly the `probe()` set), `Stub`
+  (compile-time placeholder, same signal as `is_stub()`), and
+  `Unavailable(Error)` carrying the probe failure that `probe()`
+  swallows — so a UI/diagnostic can finally show *why* a backend is
+  unusable (`LibraryLoad` = not installed vs `DeviceOpen` = library
+  loads but no device opens) without attempting a real `open()`.
+  `DriverStatus` is `#[non_exhaustive]`, has a stable `Display`
+  (`"ready"` / `"not yet implemented (stub)"` / `"unavailable: …"`)
+  and an `is_ready()` convenience. Tests pin the exact correspondence
+  with `is_stub()` + `probe()` membership across every compiled-in
+  driver and the Display shapes.
 - *(api)* Per-stream software volume: `Stream::set_volume(f32)` /
   `Stream::volume()`. A gain stage between the callback and the
   backend, stored as f32 bits in an atomic the audio thread reads

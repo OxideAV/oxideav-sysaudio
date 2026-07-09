@@ -188,6 +188,82 @@ impl std::fmt::Debug for Driver {
     }
 }
 
+/// Availability of one backend on this host *right now*, as reported
+/// by [`Driver::status`]. Collapses the crate's three availability
+/// signals — compiled-in-ness ([`drivers()`]), stub-ness
+/// ([`Driver::is_stub`]) and probe outcome ([`probe()`]) — into the
+/// single per-backend answer a UI or a diagnostic dump wants, keeping
+/// hold of the probe error that `probe()` itself swallows.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum DriverStatus {
+    /// The shared library loads and a throw-away device open succeeds:
+    /// [`crate::open`] on this backend is expected to work. Exactly the
+    /// backends [`probe()`] returns.
+    Ready,
+    /// The backend ships as a compile-time placeholder (PipeWire,
+    /// ASIO) — no host configuration can make it work. Same signal as
+    /// [`Driver::is_stub`].
+    Stub,
+    /// The backend is fully implemented but unusable on this host, and
+    /// here is why: the carried [`Error`] is the probe failure that
+    /// [`probe()`] swallows — a `LibraryLoad` when the shared library
+    /// isn't installed, a `DeviceOpen` when the library loads but no
+    /// device opens (headless box, sound server down).
+    Unavailable(Error),
+}
+
+impl DriverStatus {
+    /// `true` for [`DriverStatus::Ready`].
+    pub fn is_ready(&self) -> bool {
+        matches!(self, DriverStatus::Ready)
+    }
+}
+
+impl std::fmt::Display for DriverStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DriverStatus::Ready => write!(f, "ready"),
+            DriverStatus::Stub => write!(f, "not yet implemented (stub)"),
+            DriverStatus::Unavailable(e) => write!(f, "unavailable: {e}"),
+        }
+    }
+}
+
+impl Driver {
+    /// One-call availability triage for this backend: is it usable
+    /// right now ([`DriverStatus::Ready`]), permanently a placeholder
+    /// ([`DriverStatus::Stub`]), or implemented-but-unusable on this
+    /// host with the underlying probe error attached
+    /// ([`DriverStatus::Unavailable`])?
+    ///
+    /// This is the composed form of the triage that previously required
+    /// three calls (`is_stub()`, membership in [`probe()`], and — for
+    /// the *why* — an actual `open()` attempt, since `probe()` swallows
+    /// its errors):
+    ///
+    /// ```no_run
+    /// for d in oxideav_sysaudio::drivers() {
+    ///     println!("{:10} {}", d.name(), d.status());
+    /// }
+    /// ```
+    ///
+    /// Probing opens (and closes) a throw-away handle, so this has the
+    /// same moderate cost as [`probe()`] per backend — call it for
+    /// diagnostics/UI, not per audio period. The result is a snapshot:
+    /// plugging in a USB device or starting a sound server can turn
+    /// `Unavailable` into `Ready` at any time.
+    pub fn status(&self) -> DriverStatus {
+        if self.inner.is_stub() {
+            return DriverStatus::Stub;
+        }
+        match self.inner.probe() {
+            Ok(()) => DriverStatus::Ready,
+            Err(e) => DriverStatus::Unavailable(e),
+        }
+    }
+}
+
 impl PartialEq for Driver {
     fn eq(&self, other: &Self) -> bool {
         // Two backends are equal iff they point at the same static
@@ -597,6 +673,71 @@ mod tests {
                 d.name()
             );
         }
+    }
+
+    #[test]
+    fn status_agrees_with_is_stub_and_probe() {
+        // The tri-state must be exactly the composition of the two
+        // existing signals: Stub ⇔ is_stub(); Ready ⇔ probe()
+        // membership; Unavailable ⇔ neither. (Snapshot caveat: device
+        // state could in principle change between the two calls, but a
+        // test box doesn't hotplug audio mid-test.)
+        let probed = probe();
+        for d in drivers() {
+            let in_probe = probed.contains(&d);
+            match d.status() {
+                DriverStatus::Stub => {
+                    assert!(
+                        d.is_stub(),
+                        "{}: Stub status but is_stub()==false",
+                        d.name()
+                    );
+                    assert!(
+                        !in_probe,
+                        "{}: Stub status yet probe() accepted it",
+                        d.name()
+                    );
+                }
+                DriverStatus::Ready => {
+                    assert!(!d.is_stub(), "{}: Ready status on a stub", d.name());
+                    assert!(
+                        in_probe,
+                        "{}: Ready status but absent from probe()",
+                        d.name()
+                    );
+                }
+                DriverStatus::Unavailable(e) => {
+                    assert!(!d.is_stub(), "{}: Unavailable status on a stub", d.name());
+                    assert!(
+                        !in_probe,
+                        "{}: Unavailable ({e}) yet probe() accepted it",
+                        d.name()
+                    );
+                    // The carried error must not be the stub marker —
+                    // that's what the Stub arm is for.
+                    assert!(
+                        !matches!(e, Error::NotImplemented(_)),
+                        "{}: Unavailable carries NotImplemented",
+                        d.name()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn status_display_is_stable() {
+        // UIs print this; pin the three shapes.
+        assert_eq!(DriverStatus::Ready.to_string(), "ready");
+        assert_eq!(DriverStatus::Stub.to_string(), "not yet implemented (stub)");
+        let s = DriverStatus::Unavailable(Error::DeviceOpen {
+            backend: "x",
+            detail: "y".into(),
+        })
+        .to_string();
+        assert!(s.starts_with("unavailable: "), "got: {s}");
+        assert!(DriverStatus::Ready.is_ready());
+        assert!(!DriverStatus::Stub.is_ready());
     }
 
     #[test]
