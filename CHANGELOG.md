@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-sysaudio/compare/v0.1.1...v0.2.0) - 2026-07-09
+
+### Added
+
+- *(coreaudio)* direct HAL default_output_device override
+- *(api)* contain user-callback panics — never unwind into the OS audio stack
+- *(api)* Driver::status() — tri-state availability triage
+- *(api)* per-stream software volume + is_playing transport state
+- *(api)* pre-flight StreamRequest validation in open()
+- *(mock)* virtual hardware-free backend behind new `mock` feature
+- *(api)* Driver::is_stub() — distinguish placeholder backends from missing libs
+- *(api)* Driver::default_output_device() one-call shortcut
+- *(oss)* functional /dev/dsp backend via dlopen'd libc
+- *(alsa)* wire preferred_format via throwaway hw_params probe
+- *(api)* preferred_format negotiation read-back on WASAPI + CoreAudio
+- *(wasapi,pulse)* honour StreamRequest::buffer_frames hint
+- *(coreaudio)* per-device AudioQueue routing via HAL DeviceUID + CFRelease
+- *(api)* per-device opening via StreamRequest::with_device
+- *(api)* output-device enumeration across WASAPI / ALSA / CoreAudio
+- *(wasapi)* query real end-to-end latency via IAudioClock::GetPosition
+
+### Fixed
+
+- *(example)* sine oscillator phase truncated to an integer every callback; drop unused thiserror dep
+- *(api)* Driver equality compared thin pointers of ZST backends — two different drivers could be equal
+- *(coreaudio)* device enumeration was empty on every host — bind AudioObjectGetPropertyDataSize
+
+### Other
+
+- *(lib)* quick start reflects the streams-start-playing contract
+- *(readme)* mock backend, software volume, Driver::status, start-state contract, request validation
+- *(hw)* real-hardware lifecycle smoke test with clean headless skip
+- add CI / crates.io / docs.rs / MIT-license badges
+- refresh to current status, drop per-round changelog cruft
+- drop release-plz.toml — use release-plz defaults across the workspace
+- replace never-match regex with semver_check = false
+- migrate to centralized OxideAV/.github reusable workflows
+- pin release-plz to patch-only bumps
+
 ### Removed
 
 - Dropped the unused `thiserror` dependency — the crate's `Error` has
