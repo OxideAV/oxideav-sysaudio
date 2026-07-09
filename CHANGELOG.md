@@ -51,6 +51,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(coreaudio)* `default_output_device()` now uses the HAL's direct
+  `kAudioHardwarePropertyDefaultOutputDevice` query (one property read
+  + one name lookup) instead of the trait default's
+  enumerate-everything-and-filter reduction — the cheaper path the
+  trait doc always envisaged. The crate-level cross-check test pins
+  agreement between the two paths on real hardware.
 - *(api)* Callback panic containment: a panic in the user callback is
   caught in the wrapper `open()` installs and never unwinds into the
   backend. This closes an undefined-behaviour hole — CoreAudio and

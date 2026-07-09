@@ -905,6 +905,32 @@ impl Backend for CoreAudioBackend {
         enumerate_output_devices()
     }
 
+    /// Direct-query override of the trait's enumerate-and-filter
+    /// default: one HAL property read
+    /// (`kAudioHardwarePropertyDefaultOutputDevice` on the system
+    /// object) plus one name lookup, instead of walking every device
+    /// and probing each for output streams. Must stay in agreement
+    /// with the `is_default` tag `output_devices()` computes — the
+    /// crate-level `default_output_device_matches_enumeration` test
+    /// cross-checks the two paths on real hardware.
+    fn default_output_device(&self) -> Result<Option<Device>> {
+        let ca = ca_lib().ok_or(Error::NotImplemented("coreaudio"))?;
+        unsafe {
+            let id = hal_default_output_device(&ca);
+            if id == 0 {
+                // The HAL reports no default endpoint — a transient
+                // state between hotplug events, or a machine with no
+                // output hardware at all.
+                return Ok(None);
+            }
+            Ok(Some(Device {
+                id: id.to_string(),
+                name: hal_device_name(&ca, id),
+                is_default: true,
+            }))
+        }
+    }
+
     /// Best-effort report of the device's `NominalSampleRate` + its first
     /// output stream's `VirtualFormat` channel count. The HAL returns the
     /// rate the device is currently running at, which is what AudioQueue's
