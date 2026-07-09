@@ -20,6 +20,7 @@ audio SDK is installed.
 | Windows | WASAPI    | Functional  | `ole32.dll` + `kernel32.dll` (COM vtables invoked by hand, shared-mode)       |
 | Windows | ASIO      | Stub        | Vendor-supplied DLLs under `HKLM\SOFTWARE\ASIO` (not yet wired)               |
 | macOS   | CoreAudio | Functional  | `AudioToolbox.framework` (AudioQueue API)                                     |
+| any     | Mock      | Test-only   | none — virtual discard/capture sink (non-default cargo feature `mock`)       |
 
 `probe()` returns the subset of these whose shared object loads AND
 whose dummy-open succeeds, in the documented preference order:
@@ -39,14 +40,23 @@ directly bypasses one level of indirection.
 may or may not be installed on this host. The two cases look identical
 through `probe()` alone — both fail — so callers iterating `drivers()`
 to surface a per-backend UI label can use the compile-time flag to tell
-"not yet implemented" apart from "library not installed":
+"not yet implemented" apart from "library not installed".
+
+`Driver::status()` composes all of that into one call — and, unlike
+`probe()`, keeps hold of *why* a backend is unusable:
 
 ```rust
 for d in oxideav_sysaudio::drivers() {
-    let tag = if d.is_stub() { " (stub)" } else { "" };
-    println!("{}: {}{tag}", d.name(), d.description());
+    // "ready" | "not yet implemented (stub)" | "unavailable: <probe error>"
+    println!("{:10} {}", d.name(), d.status());
 }
 ```
+
+`DriverStatus::Unavailable(e)` carries the probe failure `probe()`
+swallows: a `LibraryLoad` means the shared library isn't installed, a
+`DeviceOpen` means the library loads but no device opens (headless
+box, sound server down). Probing opens a throw-away handle, so call
+`status()` for diagnostics/UI, not per audio period.
 
 ## Usage
 
@@ -57,8 +67,17 @@ let req = StreamRequest::new(48_000, 2);
 let mut stream = open_default(req, |out, _info| {
     out.fill(0.0); // silence
 })?;
+// Streams start in the playing state — the callback is already
+// running. pause()/play() toggle it; is_playing() reports the last
+// requested transport state.
+stream.pause()?;
 stream.play()?;
 ```
+
+Requests no backend could satisfy (`sample_rate == 0`,
+`channels == 0`, `buffer_frames == Some(0)`) are rejected up front
+with `Error::UnsupportedFormat`, uniformly across backends, before any
+shared library is loaded.
 
 Explicit driver selection:
 
@@ -115,6 +134,16 @@ if let Some(dev) = d.default_output_device()? {
 Backends without an enumeration path (PulseAudio simple API, stubs)
 surface `Ok(None)` rather than an error, matching `output_devices()`
 so an iterating caller can union per-driver results.
+
+## Software volume
+
+`Stream::set_volume(f32)` / `Stream::volume()` — a per-stream gain
+stage between the callback and the backend. `1.0` (default) is unity
+gain and bypasses the multiply entirely; `0.0` is silence; values
+above `1.0` amplify and may clip; negative/NaN clamp to `0.0`. The
+gain lives in an atomic the audio thread reads wait-free, so
+`set_volume` is safe to call from a UI thread at any rate. It is
+independent of the OS mixer volume and composes with it.
 
 ## Latency reporting
 
@@ -218,6 +247,32 @@ if let Some(fmt) = d.preferred_format(None)? {
 A backend without an introspection path surfaces as `Ok(None)` rather
 than an error so callers can iterate every probed driver without
 per-backend special-casing.
+
+## Testing without hardware — the `mock` backend
+
+The non-default cargo feature `mock` compiles in a virtual `"mock"`
+driver (any OS, no audio library, no device) that renders the callback
+from a paced worker thread into a discard — or capture — sink. It
+registers **last** in the preference order, so a real backend still
+wins whenever one works; it is kept out of the default feature set on
+purpose, because with it enabled `probe()` never comes back empty,
+which would change `open_default()`'s failure behaviour for ordinary
+users.
+
+It enumerates three virtual devices (`mock:default`, `mock:secondary`,
+`mock:capture`), honours `buffer_frames` hints verbatim, rejects
+fabricated device ids, models `latency()` as a fixed two-period
+software queue, and advances `CallbackInfo::frames_played` one period
+per callback while playing. Streams opened on `mock:capture` copy
+every rendered (post volume-gain) sample into a bounded global sink
+drained via `oxideav_sysaudio::mock::take_captured()` — this is how
+the crate's own tests verify the render pipeline sample-exactly.
+
+`tests/mock_backend.rs` drives the full public state machine through
+it on hardware-free CI; `tests/hardware_smoke.rs` runs the same
+lifecycle against the first *real* backend that probes and skips
+cleanly on headless runners (set `OXIDEAV_SYSAUDIO_STRICT_HW=1`
+locally to make environment-dependent observations hard failures).
 
 ## Non-goals (for now)
 
