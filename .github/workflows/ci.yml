@@ -14,3 +14,8 @@ jobs:
   ci:
     uses: OxideAV/.github/.github/workflows/crate-ci.yml@master
     secrets: inherit
+    with:
+      # Run the test suite with every feature on so the non-default
+      # `mock` backend (the hardware-free state-machine coverage in
+      # tests/mock_backend.rs) is exercised on the headless runners.
+      extra_test_args: "--all-features"

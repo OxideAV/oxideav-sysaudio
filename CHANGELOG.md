@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(mock)* New non-default cargo feature `mock`: a virtual,
+  target-independent backend (`driver_by_name("mock")`) that renders
+  the callback from a paced worker thread into a discard or capture
+  sink, needing no audio hardware and no loadable library. It
+  registers last in the preference order so a real backend always wins
+  when one works, enumerates three virtual devices (`mock:default` /
+  `mock:secondary` / `mock:capture`), honours `buffer_frames` hints
+  verbatim, rejects fabricated device ids with `DeviceOpen`, models
+  latency as a fixed two-period software queue, and advances the
+  `CallbackInfo::frames_played` clock only while playing. Streams
+  opened on `mock:capture` copy every rendered sample into a global
+  bounded sink drained via `oxideav_sysaudio::mock::take_captured()`.
+  A new integration suite (`tests/mock_backend.rs`) drives the whole
+  public state machine through it on hardware-free CI runners:
+  probing/registration order, enumeration + default-device agreement,
+  preferred-format introspection, hinted buffer sizes, the monotonic
+  frame clock (starts at zero, advances one period per callback),
+  pause-halts/play-resumes semantics, prompt `stop()` even with a
+  1-second buffer hint, drop-joins-the-worker teardown, per-device
+  routing, latency, and capture fidelity. The CI shim now passes
+  `extra_test_args: "--all-features"` so the suite actually runs on
+  the headless matrix. The tests also codify a previously undocumented
+  cross-backend contract: streams start in the **playing** state at
+  `open()` (every real backend initialises its `paused` flag to
+  false).
 - *(api)* `Driver::is_stub() -> bool` — compile-time capability flag
   distinguishing backends that ship as placeholders (PipeWire on Linux,
   ASIO on Windows) from working backends whose shared library may or

@@ -41,6 +41,15 @@ pub use error::{Error, Result};
 pub use format::{CallbackInfo, Device, SampleFormat, StreamFormat, StreamRequest};
 pub use stream::Stream;
 
+/// Test-support helpers for the virtual `"mock"` backend (cargo
+/// feature `mock`). See `backends::mock` module docs for the
+/// behavioural model; the backend itself is reached through the normal
+/// driver surface (`driver_by_name("mock")`).
+#[cfg(feature = "mock")]
+pub mod mock {
+    pub use crate::backends::mock::take_captured;
+}
+
 use backend::Backend;
 
 /// Public, opaque handle to a backend. Call [`drivers()`] or

@@ -24,6 +24,12 @@ oss = []
 wasapi = []
 asio = []
 coreaudio = []
+# Virtual hardware-free backend for tests/CI: adds a `"mock"` driver
+# (always last in the preference order) that renders the callback into
+# a discard/capture sink from a paced worker thread. Deliberately NOT
+# in the default set — with it enabled, `probe()` never comes back
+# empty, which changes `open_default()`'s failure behaviour.
+mock = []
 
 [dependencies]
 libloading = "0.9"

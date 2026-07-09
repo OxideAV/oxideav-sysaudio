@@ -22,6 +22,11 @@ pub(crate) mod wasapi;
 #[cfg(all(target_os = "macos", feature = "coreaudio"))]
 pub(crate) mod coreaudio;
 
+// The virtual mock backend is target-independent and always last in
+// the preference order, so it never shadows a working real backend.
+#[cfg(feature = "mock")]
+pub(crate) mod mock;
+
 pub(crate) fn drivers() -> &'static [&'static dyn Backend] {
     #[cfg(target_os = "linux")]
     {
@@ -34,6 +39,8 @@ pub(crate) fn drivers() -> &'static [&'static dyn Backend] {
             &alsa::AlsaBackend,
             #[cfg(feature = "oss")]
             &oss::OssBackend,
+            #[cfg(feature = "mock")]
+            &mock::MockBackend,
         ]
     }
     #[cfg(target_os = "windows")]
@@ -43,6 +50,8 @@ pub(crate) fn drivers() -> &'static [&'static dyn Backend] {
             &wasapi::WasapiBackend,
             #[cfg(feature = "asio")]
             &asio::AsioBackend,
+            #[cfg(feature = "mock")]
+            &mock::MockBackend,
         ]
     }
     #[cfg(target_os = "macos")]
@@ -50,10 +59,15 @@ pub(crate) fn drivers() -> &'static [&'static dyn Backend] {
         &[
             #[cfg(feature = "coreaudio")]
             &coreaudio::CoreAudioBackend,
+            #[cfg(feature = "mock")]
+            &mock::MockBackend,
         ]
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
-        &[]
+        &[
+            #[cfg(feature = "mock")]
+            &mock::MockBackend,
+        ]
     }
 }
