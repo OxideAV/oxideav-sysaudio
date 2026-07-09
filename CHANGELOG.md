@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- *(api)* `PartialEq for Driver` could report two **different**
+  backends as equal: it compared only the data pointers of the
+  `&'static dyn Backend` trait objects, but backends are zero-sized
+  types behind const-promoted references, so distinct backends can
+  share a data address (observed on the Linux/Windows CI runners,
+  where `Driver(pipewire) == Driver(mock)` compared true — caught by
+  the new `Driver::status()` consistency test). Equality now uses the
+  backend name, which is unique per target and is the actual identity;
+  a regression test asserts pairwise inequality across `drivers()`.
 - *(coreaudio)* Device enumeration returned an **empty list on every
   host**: all four variable-length HAL queries (`hal_all_devices`,
   `hal_is_output_device`, `hal_first_output_stream`,

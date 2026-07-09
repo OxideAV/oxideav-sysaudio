@@ -266,14 +266,17 @@ impl Driver {
 
 impl PartialEq for Driver {
     fn eq(&self, other: &Self) -> bool {
-        // Two backends are equal iff they point at the same static
-        // singleton. Backend names are unique per target_os so comparing
-        // by name is equivalent; doing the pointer comparison is a
-        // cheap invariant check against accidental duplicates.
-        std::ptr::eq(
-            self.inner as *const _ as *const (),
-            other.inner as *const _ as *const (),
-        )
+        // Backend names are unique per target_os, so name equality IS
+        // the identity relation. Pointer comparison is not sound here
+        // in either direction: the backends are zero-sized types and
+        // the `&'static` references in the DRIVERS slice come from
+        // const promotion, so two *different* backends can share a
+        // data address (observed on the Linux and Windows CI runners,
+        // where `Driver(pipewire) == Driver(mock)` compared true under
+        // the old thin-pointer comparison), while one backend's vtable
+        // can be duplicated across codegen units making a fat-pointer
+        // comparison of the *same* backend false.
+        self.name() == other.name()
     }
 }
 
@@ -650,7 +653,7 @@ mod tests {
         // that's using `is_stub()` to skip stubs in a UI.
         for d in drivers() {
             if d.is_stub() {
-                let stub_passed_probe = probe().iter().any(|p| std::ptr::eq(p.inner, d.inner));
+                let stub_passed_probe = probe().contains(&d);
                 assert!(
                     !stub_passed_probe,
                     "{}: is_stub() == true but probe() accepted it",
@@ -672,6 +675,28 @@ mod tests {
                 "{}: appears in probe() yet is_stub() returns true",
                 d.name()
             );
+        }
+    }
+
+    #[test]
+    fn distinct_drivers_compare_unequal() {
+        // Regression test: backends are ZSTs behind const-promoted
+        // &'static references, so two different backends can share a
+        // data address — the old thin-pointer PartialEq made
+        // Driver(pipewire) == Driver(mock) compare true on the Linux
+        // and Windows CI runners. Identity is the (per-target-unique)
+        // name.
+        let all = drivers();
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                assert_eq!(
+                    a == b,
+                    i == j,
+                    "{} vs {}: equality must hold exactly for the same backend",
+                    a.name(),
+                    b.name()
+                );
+            }
         }
     }
 
