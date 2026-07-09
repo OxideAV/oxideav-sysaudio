@@ -7,8 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- Dropped the unused `thiserror` dependency — the crate's `Error` has
+  hand-written `Display`/`Error` impls and nothing referenced the
+  macro; it only added a proc-macro chain (`syn`/`quote`) to every
+  consumer's cold build.
+
 ### Fixed
 
+- *(example)* `sine.rs` carried its oscillator phase across callbacks
+  through an `AtomicU64` with `p as u64` — truncating the fractional
+  phase (a value kept in `[0, τ)`, so effectively resetting to an
+  integer) at every period boundary, which detunes the tone and adds a
+  periodic discontinuity. The phase now round-trips losslessly as f32
+  bits in an `AtomicU32`.
 - *(api)* `PartialEq for Driver` could report two **different**
   backends as equal: it compared only the data pointers of the
   `&'static dyn Backend` trait objects, but backends are zero-sized

@@ -33,4 +33,3 @@ mock = []
 
 [dependencies]
 libloading = "0.9"
-thiserror = "2"

@@ -1,6 +1,6 @@
 // Smoke test — play a 440 Hz sine for 1.5 s via probe()'s top pick.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,12 +46,15 @@ fn main() {
         None => oxideav_sysaudio::StreamRequest::new(sample_rate, channels),
     };
 
-    let phase = Arc::new(AtomicU64::new(0));
+    // Phase is carried across callbacks as f32 bits in an AtomicU32 —
+    // storing it as an integer would truncate the fractional phase at
+    // every period boundary and detune/click the tone.
+    let phase = Arc::new(AtomicU32::new(0.0f32.to_bits()));
     let phase_cb = phase.clone();
     let mut stream = oxideav_sysaudio::open_default(req, move |out, _info| {
         let ch = channels as usize;
         let frames = out.len() / ch;
-        let mut p = phase_cb.load(Ordering::Relaxed) as f32;
+        let mut p = f32::from_bits(phase_cb.load(Ordering::Relaxed));
         let step = 440.0 * 2.0 * std::f32::consts::PI / sample_rate as f32;
         for f in 0..frames {
             let v = (p).sin() * 0.1;
@@ -63,7 +66,7 @@ fn main() {
                 p -= std::f32::consts::TAU;
             }
         }
-        phase_cb.store(p as u64, Ordering::Relaxed);
+        phase_cb.store(p.to_bits(), Ordering::Relaxed);
     })
     .expect("open failed");
 
