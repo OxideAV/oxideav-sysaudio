@@ -29,6 +29,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(tests)* Real-hardware lifecycle smoke test
+  (`tests/hardware_smoke.rs`): one full open → play → latency → pause
+  → resume → volume → drop cycle rendering silence through the first
+  real (non-mock) backend that probes, dumping devices / preferred
+  format / latency / teardown time. Headless runners skip cleanly
+  (nothing probes). Pure-software invariants (sane negotiated format,
+  transport calls return, teardown under 5 s) always assert;
+  environment-dependent observations (callbacks arriving, latency
+  reported) only assert under `OXIDEAV_SYSAUDIO_STRICT_HW=1` for local
+  runs on known-good hardware. This test's device dump is what exposed
+  the CoreAudio empty-enumeration bug above.
 - *(api)* `Driver::status() -> DriverStatus` — one-call availability
   triage collapsing the three existing signals into a tri-state:
   `Ready` (probe succeeds; exactly the `probe()` set), `Stub`
