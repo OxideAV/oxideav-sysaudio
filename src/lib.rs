@@ -18,6 +18,9 @@
 //!     out.fill(0.0);
 //! })
 //! .expect("no audio driver available");
+//! // The stream is already playing — open() returns it running.
+//! // pause()/play() toggle it; set_volume() adjusts a software gain.
+//! stream.pause().ok();
 //! stream.play().ok();
 //! // ... audio plays for the lifetime of `stream` ...
 //! ```
