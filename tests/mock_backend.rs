@@ -330,6 +330,83 @@ fn volume_zero_silences_output() {
 }
 
 #[test]
+fn panicking_callback_is_contained_and_stream_survives() {
+    let _guard = capture_lock();
+    let _ = mock::take_captured();
+    let devs = mock_driver().output_devices().expect("mock enumerates");
+    let cap = devs
+        .iter()
+        .find(|d| d.id == "mock:capture")
+        .expect("capture device listed");
+    let calls = Arc::new(AtomicU64::new(0));
+    let calls_cb = calls.clone();
+    let req = StreamRequest::new(48_000, 1).with_buffer_frames(Some(64));
+    let mut stream = open_on(mock_driver(), cap, req, move |out, _| {
+        calls_cb.fetch_add(1, Ordering::Relaxed);
+        out.fill(0.75); // partially-produced garbage that must be discarded
+        panic!("user callback exploded");
+    })
+    .expect("mock open");
+
+    // The worker must survive the panic: rendering continues (as
+    // silence) and the clock keeps advancing, so the capture sink
+    // keeps filling.
+    let mut got: Vec<f32> = Vec::new();
+    assert!(
+        wait_until(DEADLINE, || {
+            got.extend(mock::take_captured());
+            got.len() >= 256
+        }),
+        "rendering stopped after the callback panicked — worker died"
+    );
+    assert!(
+        got.iter().all(|&x| x == 0.0),
+        "panicked period leaked non-silence to the backend"
+    );
+    // The callback must never be re-entered after its panic.
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "poisoned callback was invoked again"
+    );
+    // The stream stays controllable.
+    stream.pause().expect("pause after contained panic");
+    stream.play().expect("play after contained panic");
+    drop(stream); // teardown must not hang or double-panic
+}
+
+#[test]
+fn rapid_transport_toggling_and_parallel_streams_do_not_wedge() {
+    // Hammer the play/pause edge from the control thread while the
+    // worker renders, across several concurrent streams — a cheap
+    // deadlock/wedge detector for the shared state machine.
+    let mut streams = Vec::new();
+    for _ in 0..4 {
+        let s = open(
+            mock_driver(),
+            StreamRequest::new(48_000, 2).with_buffer_frames(Some(32)),
+            |out, _| out.fill(0.1),
+        )
+        .expect("mock open");
+        streams.push(s);
+    }
+    let t0 = Instant::now();
+    for _ in 0..200 {
+        for s in &mut streams {
+            s.pause().expect("pause");
+            s.play().expect("play");
+        }
+    }
+    assert!(
+        t0.elapsed() < Duration::from_secs(5),
+        "transport toggling took implausibly long — contention bug"
+    );
+    for s in streams {
+        s.stop(); // each must return promptly
+    }
+}
+
+#[test]
 fn capture_sink_sees_exactly_what_the_callback_rendered() {
     let _guard = capture_lock();
     let _ = mock::take_captured(); // drain leftovers from other streams

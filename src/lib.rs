@@ -365,11 +365,25 @@ fn validate_request(backend: &'static str, req: &StreamRequest) -> Result<()> {
 /// A per-stream software gain stage sits between the callback and the
 /// backend — see [`Stream::set_volume`]. At the default unity gain it
 /// is a single atomic load per period.
+///
+/// # Callback panics
+///
+/// A panic in the callback is caught, never unwinding into the
+/// backend: several backends run the callback on an OS-owned audio
+/// thread (CoreAudio, WASAPI), where unwinding across the foreign
+/// stack frame would be undefined behaviour, and on the worker-thread
+/// backends it would silently kill the render loop. Instead, the
+/// period that panicked is replaced with silence, the stream keeps
+/// running, and every subsequent period is silence too — the callback
+/// is never invoked again (an `FnMut` that panicked mid-mutation is
+/// not safe to re-enter). The stream stays controllable
+/// (`pause`/`stop`/drop all work); tear it down and reopen to recover
+/// audio.
 pub fn open<F>(driver: Driver, req: StreamRequest, cb: F) -> Result<Stream>
 where
     F: FnMut(&mut [f32], &CallbackInfo) + Send + 'static,
 {
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::Arc;
 
     validate_request(driver.inner.name(), &req)?;
@@ -379,9 +393,24 @@ where
     // the default path costs one relaxed load per period.
     let volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
     let gain = volume.clone();
+    // Panic containment: set once the user callback panics; from then
+    // on the wrapper renders silence without re-entering the callback.
+    let poisoned = AtomicBool::new(false);
     let mut cb = cb;
     let wrapped = move |out: &mut [f32], info: &CallbackInfo| {
-        cb(out, info);
+        if poisoned.load(Ordering::Relaxed) {
+            out.fill(0.0);
+            return;
+        }
+        // AssertUnwindSafe: on panic we permanently stop calling `cb`,
+        // so no code ever observes its (potentially broken) state, and
+        // `out` is fully overwritten with silence below.
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(out, info)));
+        if caught.is_err() {
+            poisoned.store(true, Ordering::Relaxed);
+            out.fill(0.0);
+            return;
+        }
         let g = f32::from_bits(gain.load(Ordering::Relaxed));
         if g != 1.0 {
             for s in out.iter_mut() {

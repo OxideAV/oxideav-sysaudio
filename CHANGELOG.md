@@ -51,6 +51,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(api)* Callback panic containment: a panic in the user callback is
+  caught in the wrapper `open()` installs and never unwinds into the
+  backend. This closes an undefined-behaviour hole — CoreAudio and
+  WASAPI invoke the callback on an OS-owned audio thread, where
+  unwinding across the foreign stack frame is UB, and on the
+  worker-thread backends a panic silently killed the render loop. The
+  panicked period is replaced with silence, the stream keeps running
+  and stays controllable (`pause`/`stop`/drop), and the callback is
+  never re-entered (an `FnMut` that panicked mid-mutation isn't safe
+  to resume). Mock-backend test pins all of it: worker survives,
+  post-panic output is pure silence including the partially-written
+  panicking period, exactly one invocation, transport still works.
 - *(tests)* Real-hardware lifecycle smoke test
   (`tests/hardware_smoke.rs`): one full open → play → latency → pause
   → resume → volume → drop cycle rendering silence through the first
