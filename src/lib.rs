@@ -282,13 +282,36 @@ fn validate_request(backend: &'static str, req: &StreamRequest) -> Result<()> {
 /// `buffer_frames == Some(0)`) are rejected up front with
 /// [`Error::UnsupportedFormat`], uniformly across backends, before any
 /// shared library is loaded or device opened.
+///
+/// A per-stream software gain stage sits between the callback and the
+/// backend — see [`Stream::set_volume`]. At the default unity gain it
+/// is a single atomic load per period.
 pub fn open<F>(driver: Driver, req: StreamRequest, cb: F) -> Result<Stream>
 where
     F: FnMut(&mut [f32], &CallbackInfo) + Send + 'static,
 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
     validate_request(driver.inner.name(), &req)?;
-    let inner = driver.inner.open(req, Box::new(cb))?;
-    Ok(Stream::new(inner))
+    // Software volume: the gain lives in an atomic shared between the
+    // Stream handle (writer) and this wrapper around the user callback
+    // (reader, on the audio thread). Unity gain skips the multiply so
+    // the default path costs one relaxed load per period.
+    let volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+    let gain = volume.clone();
+    let mut cb = cb;
+    let wrapped = move |out: &mut [f32], info: &CallbackInfo| {
+        cb(out, info);
+        let g = f32::from_bits(gain.load(Ordering::Relaxed));
+        if g != 1.0 {
+            for s in out.iter_mut() {
+                *s *= g;
+            }
+        }
+    };
+    let inner = driver.inner.open(req, Box::new(wrapped))?;
+    Ok(Stream::new(inner, volume))
 }
 
 /// Convenience wrapper for `open(default_driver(), …)`.

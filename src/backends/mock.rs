@@ -60,8 +60,11 @@ static CAPTURE: Mutex<Vec<f32>> = Mutex::new(Vec::new());
 const CAPTURE_CAP_SAMPLES: usize = 1 << 22;
 
 /// Drain and return everything the `"mock:capture"` device rendered
-/// since the previous drain (or since process start). The sink is
-/// global — tests that assert on its contents should serialise among
+/// since the previous drain (or since process start). Samples arrive
+/// exactly as a real backend would receive them — i.e. after the
+/// software volume gain [`crate::Stream::set_volume`] installs — so
+/// tests can observe the full render pipeline. The sink is global —
+/// tests that assert on its contents should serialise among
 /// themselves.
 pub fn take_captured() -> Vec<f32> {
     std::mem::take(&mut *CAPTURE.lock().unwrap())

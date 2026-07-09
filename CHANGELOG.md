@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(api)* Per-stream software volume: `Stream::set_volume(f32)` /
+  `Stream::volume()`. A gain stage between the callback and the
+  backend, stored as f32 bits in an atomic the audio thread reads
+  wait-free; unity gain (the default) bypasses the multiply so the
+  default path costs one relaxed load per period. `0.0` is silence,
+  values above `1.0` amplify (may clip), negative/NaN clamp to `0.0`.
+  Independent of — and composing with — the OS mixer volume. Verified
+  end-to-end through the mock backend's capture sink (which observes
+  post-gain samples, exactly what a real backend would receive):
+  attenuation scales samples, zero silences, defaults/clamping pinned.
+- *(api)* `Stream::is_playing()` — the last transport state
+  successfully requested through the handle (`true` from `open()`
+  since streams start playing, toggled by `play()`/`pause()`, `false`
+  once stopped). Tracks requests, not a hardware query. `Stream` also
+  gains a `Debug` impl.
 - *(api)* Pre-flight request validation in `open()` (and therefore
   `open_default()` / `open_on()`): requests no backend could ever
   satisfy — `sample_rate == 0`, `channels == 0`,

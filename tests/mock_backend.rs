@@ -265,6 +265,71 @@ fn latency_models_two_periods() {
 }
 
 #[test]
+fn is_playing_tracks_transport_requests() {
+    let mut s = open(mock_driver(), StreamRequest::new(8_000, 1), |_, _| {}).expect("mock open");
+    assert!(s.is_playing(), "streams start in the playing state");
+    s.pause().expect("mock pause");
+    assert!(!s.is_playing());
+    s.play().expect("mock play");
+    assert!(s.is_playing());
+}
+
+#[test]
+fn volume_getter_defaults_and_clamps() {
+    let s = open(mock_driver(), StreamRequest::new(8_000, 1), |_, _| {}).expect("mock open");
+    assert_eq!(s.volume(), 1.0, "default volume is unity gain");
+    s.set_volume(0.25);
+    assert_eq!(s.volume(), 0.25);
+    s.set_volume(2.0);
+    assert_eq!(s.volume(), 2.0, "amplification above 1.0 is allowed");
+    s.set_volume(-3.0);
+    assert_eq!(s.volume(), 0.0, "negative volume clamps to silence");
+    s.set_volume(f32::NAN);
+    assert_eq!(s.volume(), 0.0, "NaN clamps to silence");
+}
+
+/// Open a capture stream whose callback writes `rendered` everywhere,
+/// set `volume`, then wait until a freshly drained chunk consists
+/// entirely of `expect` — i.e. the gain change has propagated to the
+/// audio thread. Panics on deadline.
+fn assert_capture_converges(rendered: f32, volume: f32, expect: f32) {
+    let _guard = capture_lock();
+    let _ = mock::take_captured(); // drain leftovers
+    let devs = mock_driver().output_devices().expect("mock enumerates");
+    let cap = devs
+        .iter()
+        .find(|d| d.id == "mock:capture")
+        .expect("capture device listed");
+    let req = StreamRequest::new(48_000, 1).with_buffer_frames(Some(64));
+    let s = open_on(mock_driver(), cap, req, move |out, _| out.fill(rendered))
+        .expect("mock open on capture");
+    s.set_volume(volume);
+    // Chunks rendered before set_volume() landed may carry the old
+    // gain; converge on "an entire freshly-drained, non-empty chunk is
+    // at the new value".
+    let ok = wait_until(DEADLINE, || {
+        let chunk = mock::take_captured();
+        !chunk.is_empty() && chunk.iter().all(|&x| x == expect)
+    });
+    drop(s);
+    assert!(
+        ok,
+        "capture never converged: cb wrote {rendered}, volume {volume}, expected {expect}"
+    );
+}
+
+#[test]
+fn volume_scales_rendered_samples() {
+    // 0.5 × 0.5 is exact in f32, so equality is safe.
+    assert_capture_converges(0.5, 0.5, 0.25);
+}
+
+#[test]
+fn volume_zero_silences_output() {
+    assert_capture_converges(1.0, 0.0, 0.0);
+}
+
+#[test]
 fn capture_sink_sees_exactly_what_the_callback_rendered() {
     let _guard = capture_lock();
     let _ = mock::take_captured(); // drain leftovers from other streams
