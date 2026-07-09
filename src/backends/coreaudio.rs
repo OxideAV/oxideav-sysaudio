@@ -318,9 +318,26 @@ type Fn_AudioObjectGetPropertyData = unsafe extern "C" fn(
     outData: *mut c_void,
 ) -> OSStatus;
 
+/// `AudioObjectGetPropertyDataSize(inObjectID, inAddress, 0, NULL,
+/// outDataSize)` — the HAL's dedicated size query for variable-length
+/// properties (device lists, stream lists, C-string names): the
+/// documented way to learn a property's byte size before allocating.
+/// Calling `AudioObjectGetPropertyData` with a NULL `outData` is NOT a
+/// size query — on current macOS every such call fails (observed
+/// empirically on 2026-07 hardware), which made device enumeration
+/// silently return an empty list.
+type Fn_AudioObjectGetPropertyDataSize = unsafe extern "C" fn(
+    inObjectID: AudioObjectID,
+    inAddress: *const AudioObjectPropertyAddress,
+    inQualifierDataSize: u32,
+    inQualifierData: *const c_void,
+    outDataSize: *mut u32,
+) -> OSStatus;
+
 struct CaLib {
     _lib: Library,
     AudioObjectGetPropertyData: Fn_AudioObjectGetPropertyData,
+    AudioObjectGetPropertyDataSize: Fn_AudioObjectGetPropertyDataSize,
 }
 
 unsafe impl Send for CaLib {}
@@ -348,8 +365,12 @@ impl CaLib {
             let s: Symbol<Fn_AudioObjectGetPropertyData> =
                 lib.get(b"AudioObjectGetPropertyData\0")?;
             let f = *s;
+            let s_size: Symbol<Fn_AudioObjectGetPropertyDataSize> =
+                lib.get(b"AudioObjectGetPropertyDataSize\0")?;
+            let f_size = *s_size;
             Ok(Arc::new(CaLib {
                 AudioObjectGetPropertyData: f,
+                AudioObjectGetPropertyDataSize: f_size,
                 _lib: lib,
             }))
         }
@@ -512,16 +533,11 @@ unsafe fn hal_first_output_stream(ca: &CaLib, device: AudioObjectID) -> Option<A
         mScope: kAudioObjectPropertyScopeOutput,
         mElement: kAudioObjectPropertyElementMain,
     };
-    // Two-step idiom: first call with outData=NULL to learn the byte
-    // size, then allocate and re-query. The HAL insists on this even
-    // when we only want one element.
+    // Two-step idiom: `AudioObjectGetPropertyDataSize` to learn the
+    // byte size, then allocate and query the data. The HAL insists on
+    // this even when we only want one element.
     let mut size: u32 = 0;
-    // Apple's API treats "get size" specially: pass NULL outData and
-    // a 0 ioDataSize-in / size-out receives the real size. Several
-    // HAL impls tolerate a non-NULL outData too as long as
-    // *ioDataSize == 0, but NULL is the documented form.
-    let r =
-        (ca.AudioObjectGetPropertyData)(device, &addr, 0, ptr::null(), &mut size, ptr::null_mut());
+    let r = (ca.AudioObjectGetPropertyDataSize)(device, &addr, 0, ptr::null(), &mut size);
     if r != 0 || size < std::mem::size_of::<AudioObjectID>() as u32 {
         return None;
     }
@@ -659,13 +675,12 @@ unsafe fn hal_all_devices(ca: &CaLib) -> Vec<AudioObjectID> {
         mElement: kAudioObjectPropertyElementMain,
     };
     let mut size: u32 = 0;
-    let r = (ca.AudioObjectGetPropertyData)(
+    let r = (ca.AudioObjectGetPropertyDataSize)(
         kAudioObjectSystemObject,
         &addr,
         0,
         ptr::null(),
         &mut size,
-        ptr::null_mut(),
     );
     if r != 0 || size < std::mem::size_of::<AudioObjectID>() as u32 {
         return Vec::new();
@@ -698,8 +713,7 @@ unsafe fn hal_is_output_device(ca: &CaLib, device: AudioObjectID) -> bool {
         mElement: kAudioObjectPropertyElementMain,
     };
     let mut size: u32 = 0;
-    let r =
-        (ca.AudioObjectGetPropertyData)(device, &addr, 0, ptr::null(), &mut size, ptr::null_mut());
+    let r = (ca.AudioObjectGetPropertyDataSize)(device, &addr, 0, ptr::null(), &mut size);
     r == 0 && size >= std::mem::size_of::<AudioObjectID>() as u32
 }
 
@@ -714,8 +728,7 @@ unsafe fn hal_device_name(ca: &CaLib, device: AudioObjectID) -> String {
         mElement: kAudioObjectPropertyElementMain,
     };
     let mut size: u32 = 0;
-    let r =
-        (ca.AudioObjectGetPropertyData)(device, &addr, 0, ptr::null(), &mut size, ptr::null_mut());
+    let r = (ca.AudioObjectGetPropertyDataSize)(device, &addr, 0, ptr::null(), &mut size);
     if r != 0 || size == 0 {
         return String::new();
     }
@@ -1417,6 +1430,49 @@ mod tests {
             }
             Ok(_) => panic!("CoreAudio accepted a non-numeric device id; routing bug"),
         }
+    }
+
+    #[test]
+    fn enumeration_includes_the_default_output_device() {
+        // Regression test for the empty-enumeration bug: every
+        // variable-length HAL query used `AudioObjectGetPropertyData`
+        // with a NULL outData as a "size query", which fails on
+        // current macOS — so `hal_all_devices` returned an empty Vec
+        // and `output_devices()` reported zero devices on hosts with
+        // working speakers, while `open()`/`latency()` (fixed-size
+        // queries) kept working and masked it. The real size query is
+        // the dedicated `AudioObjectGetPropertyDataSize` symbol.
+        //
+        // Gate: only meaningful when the HAL reports a default output
+        // device. A headless CI box (or a non-mac cross-build) skips
+        // cleanly.
+        let Some(ca) = ca_lib() else {
+            eprintln!("SKIP: CoreAudio.framework not loadable");
+            return;
+        };
+        let default = unsafe { hal_default_output_device(&ca) };
+        if default == 0 {
+            eprintln!("SKIP: HAL reports no default output device");
+            return;
+        }
+        let devs = enumerate_output_devices().expect("enumeration must not error");
+        assert!(
+            !devs.is_empty(),
+            "HAL reports default output {default} but enumeration is empty \
+             (size-query regression?)"
+        );
+        let entry = devs
+            .iter()
+            .find(|d| d.id == default.to_string())
+            .unwrap_or_else(|| {
+                panic!("default output {default} missing from enumeration: {devs:?}")
+            });
+        assert!(entry.is_default, "default entry not tagged: {entry:?}");
+        assert!(
+            !entry.name.is_empty(),
+            "device name lookup failed for the default output (size-query \
+             regression in hal_device_name?)"
+        );
     }
 
     #[test]

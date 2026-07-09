@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- *(coreaudio)* Device enumeration returned an **empty list on every
+  host**: all four variable-length HAL queries (`hal_all_devices`,
+  `hal_is_output_device`, `hal_first_output_stream`,
+  `hal_device_name`) used `AudioObjectGetPropertyData` with a NULL
+  `outData` pointer as a "size query", which is not a size query and
+  fails on current macOS. Since `open()` / `latency()` use fixed-size
+  queries, playback kept working and masked the bug —
+  `output_devices()` reported no devices on a MacBook with working
+  speakers, `default_output_device()` returned `Ok(None)`, and the
+  per-stream HAL latency component silently dropped out of
+  `latency()`. `CaLib` now also binds the HAL's dedicated
+  `AudioObjectGetPropertyDataSize` symbol and every size-then-data
+  site uses it. Verified live: the built-in output enumerates with its
+  name and default tag, and `latency()` gained the previously-lost
+  stream-latency component. A hardware-gated regression unit test pins
+  it (when the HAL reports a default output device, enumeration must
+  contain it, tagged and named; headless runners skip cleanly).
+
 ### Added
 
 - *(api)* `Driver::status() -> DriverStatus` — one-call availability
