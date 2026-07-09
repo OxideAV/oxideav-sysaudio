@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(api)* Pre-flight request validation in `open()` (and therefore
+  `open_default()` / `open_on()`): requests no backend could ever
+  satisfy — `sample_rate == 0`, `channels == 0`,
+  `buffer_frames == Some(0)` — are rejected up front with
+  `Error::UnsupportedFormat`, uniformly across backends and before any
+  shared library is loaded or device touched. Previously the failure
+  mode depended on which driver won the probe (an OS error code at
+  best, division-by-zero in a backend's period math at worst). A new
+  unit test pins the contract across every compiled-in driver, stubs
+  included; it is fully deterministic on headless CI because
+  validation runs before any dlopen.
 - *(mock)* New non-default cargo feature `mock`: a virtual,
   target-independent backend (`driver_by_name("mock")`) that renders
   the callback from a paced worker thread into a discard or capture

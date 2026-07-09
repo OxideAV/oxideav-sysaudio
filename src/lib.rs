@@ -242,13 +242,51 @@ pub fn driver_by_name(name: &str) -> Option<Driver> {
         .map(|b| Driver { inner: *b })
 }
 
+/// Reject requests no backend could ever satisfy, before any library
+/// gets loaded or device touched. Keeps the failure mode uniform across
+/// backends: a zero rate or channel count would otherwise surface as
+/// anything from an OS error code to a division-by-zero in a backend's
+/// period math, depending on which driver won the probe.
+fn validate_request(backend: &'static str, req: &StreamRequest) -> Result<()> {
+    if req.sample_rate == 0 {
+        return Err(Error::UnsupportedFormat {
+            backend,
+            detail: "requested sample_rate = 0; it must be non-zero".into(),
+        });
+    }
+    if req.channels == 0 {
+        return Err(Error::UnsupportedFormat {
+            backend,
+            detail: "requested channels = 0; at least one output channel is required".into(),
+        });
+    }
+    if req.buffer_frames == Some(0) {
+        return Err(Error::UnsupportedFormat {
+            backend,
+            detail: "requested buffer_frames = Some(0); pass None for the backend default".into(),
+        });
+    }
+    Ok(())
+}
+
 /// Open an output stream on the given backend. The callback is invoked
 /// from a backend-owned thread with f32 interleaved samples; fill it
 /// with audio to play, or write zeros for silence.
+///
+/// The returned stream starts in the **playing** state — the callback
+/// begins running as soon as `open()` returns. Call
+/// [`Stream::pause`] first if you need to open ahead of time and start
+/// playback later.
+///
+/// Unsatisfiable requests (`sample_rate == 0`, `channels == 0`,
+/// `buffer_frames == Some(0)`) are rejected up front with
+/// [`Error::UnsupportedFormat`], uniformly across backends, before any
+/// shared library is loaded or device opened.
 pub fn open<F>(driver: Driver, req: StreamRequest, cb: F) -> Result<Stream>
 where
     F: FnMut(&mut [f32], &CallbackInfo) + Send + 'static,
 {
+    validate_request(driver.inner.name(), &req)?;
     let inner = driver.inner.open(req, Box::new(cb))?;
     Ok(Stream::new(inner))
 }
@@ -535,6 +573,33 @@ mod tests {
                 "{}: appears in probe() yet is_stub() returns true",
                 d.name()
             );
+        }
+    }
+
+    #[test]
+    fn unsatisfiable_requests_rejected_before_dispatch() {
+        // Pre-flight validation is backend-independent and runs before
+        // any library load, so this is fully deterministic even on a
+        // headless CI box: every driver (stubs included) must reject
+        // these with UnsupportedFormat, never with a library/probe
+        // error, and never by panicking inside period math.
+        for d in drivers() {
+            let bad = [
+                StreamRequest::new(0, 2),
+                StreamRequest::new(48_000, 0),
+                StreamRequest::new(48_000, 2).with_buffer_frames(Some(0)),
+            ];
+            for req in bad {
+                let desc = format!(
+                    "rate={} ch={} buf={:?}",
+                    req.sample_rate, req.channels, req.buffer_frames
+                );
+                match open(d, req, |_, _| {}) {
+                    Err(Error::UnsupportedFormat { .. }) => {}
+                    Err(e) => panic!("{} [{desc}]: expected UnsupportedFormat, got {e}", d.name()),
+                    Ok(_) => panic!("{} [{desc}]: accepted an unsatisfiable request", d.name()),
+                }
+            }
         }
     }
 
