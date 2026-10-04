@@ -72,6 +72,7 @@ let mut stream = open_default(req, |out, _info| {
 // requested transport state.
 stream.pause()?;
 stream.play()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 Requests no backend could satisfy (`sample_rate == 0`,
@@ -82,9 +83,12 @@ shared library is loaded.
 Explicit driver selection:
 
 ```rust
+# let req = oxideav_sysaudio::StreamRequest::new(48_000, 2);
+# let callback = |out: &mut [f32], _info: &oxideav_sysaudio::CallbackInfo| out.fill(0.0);
 let d = oxideav_sysaudio::driver_by_name("alsa")
     .ok_or("alsa not compiled in")?;
 let stream = oxideav_sysaudio::open(d, req, callback)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 ## Device enumeration
@@ -99,6 +103,7 @@ for dev in d.output_devices()? {
     let tag = if dev.is_default { " (default)" } else { "" };
     println!("{}{tag}  [{}]", dev.name, dev.id);
 }
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 - `id` is the backend-native opaque token (an ALSA PCM name like
@@ -129,6 +134,7 @@ let d = oxideav_sysaudio::default_driver().ok_or("no driver")?;
 if let Some(dev) = d.default_output_device()? {
     println!("default sink: {} [{}]", dev.name, dev.id);
 }
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 Backends without an enumeration path (PulseAudio simple API, stubs)
@@ -187,6 +193,7 @@ for dev in d.output_devices()? {
         break;
     }
 }
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 | Backend   | Per-device routing                                                              |
@@ -235,6 +242,7 @@ if let Some(fmt) = d.preferred_format(None)? {
     // Resample our 44.1 kHz pipeline to fmt.sample_rate before open().
     println!("native: {} Hz, {} ch", fmt.sample_rate, fmt.channels);
 }
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 | Backend   | Source of the report                                                                                                       |
