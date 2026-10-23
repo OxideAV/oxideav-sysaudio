@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- edition 2024, MSRV 1.95.
+
 ### Removed
 
 - Dropped the unused `thiserror` dependency — the crate's `Error` has

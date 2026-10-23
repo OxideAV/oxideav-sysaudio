@@ -50,7 +50,6 @@ type REFERENCE_TIME = c_longlong;
 
 const S_OK: HRESULT = 0;
 const WAIT_OBJECT_0: DWORD = 0;
-const INFINITE: DWORD = 0xFFFF_FFFF;
 
 const COINIT_MULTITHREADED: DWORD = 0x0;
 const CLSCTX_ALL: DWORD = 0x17;
@@ -380,12 +379,6 @@ struct IAudioClockVtbl {
         unsafe extern "system" fn(this: *mut c_void, pdwCharacteristics: *mut DWORD) -> HRESULT,
 }
 
-// COM objects are pointers to pointers to vtables.
-#[repr(C)]
-struct ComObj<V> {
-    vtbl: *const V,
-}
-
 // ---------------------------------------------------------------------------
 // Loaded libraries — ole32 + kernel32
 // ---------------------------------------------------------------------------
@@ -488,18 +481,20 @@ fn lib() -> Result<Arc<WinLibs>> {
 
 // Convenience wrappers around the vtable indirections.
 unsafe fn com_release(obj: *mut c_void) {
-    if obj.is_null() {
-        return;
+    unsafe {
+        if obj.is_null() {
+            return;
+        }
+        let vtbl = *(obj as *mut *const IUnknownVtbl);
+        ((*vtbl).Release)(obj);
     }
-    let vtbl = *(obj as *mut *const IUnknownVtbl);
-    ((*vtbl).Release)(obj);
 }
 
 // Helper: call CoInitializeEx once per thread. Return value can be
 // S_OK, S_FALSE (already initialized — still fine), or RPC_E_CHANGED_MODE
 // which we tolerate.
 unsafe fn co_init(l: &WinLibs) -> HRESULT {
-    (l.CoInitializeEx)(ptr::null_mut(), COINIT_MULTITHREADED)
+    unsafe { (l.CoInitializeEx)(ptr::null_mut(), COINIT_MULTITHREADED) }
 }
 
 // ---------------------------------------------------------------------------
@@ -583,147 +578,163 @@ impl Backend for WasapiBackend {
 /// Stops at the first `0` code unit or after a generous cap so a missing
 /// terminator can't run off the end of mapped memory.
 unsafe fn wide_to_string(p: *const u16) -> String {
-    if p.is_null() {
-        return String::new();
+    unsafe {
+        if p.is_null() {
+            return String::new();
+        }
+        let mut len = 0usize;
+        while *p.add(len) != 0 && len < 8192 {
+            len += 1;
+        }
+        let slice = std::slice::from_raw_parts(p, len);
+        String::from_utf16_lossy(slice)
     }
-    let mut len = 0usize;
-    while *p.add(len) != 0 && len < 8192 {
-        len += 1;
-    }
-    let slice = std::slice::from_raw_parts(p, len);
-    String::from_utf16_lossy(slice)
 }
 
 /// Read the friendly name off an `IMMDevice` via its property store.
 /// Returns an empty string if the store, the value, or the VT type isn't
 /// what we expect — the caller still lists the device, just unlabeled.
 unsafe fn device_friendly_name(l: &WinLibs, device: *mut c_void) -> String {
-    let device_vtbl = *(device as *mut *const IMMDeviceVtbl);
-    let mut store: *mut c_void = ptr::null_mut();
-    let hr = ((*device_vtbl).OpenPropertyStore)(device, STGM_READ, &mut store);
-    if hr != S_OK || store.is_null() {
-        return String::new();
+    unsafe {
+        let device_vtbl = *(device as *mut *const IMMDeviceVtbl);
+        let mut store: *mut c_void = ptr::null_mut();
+        let hr = ((*device_vtbl).OpenPropertyStore)(device, STGM_READ, &mut store);
+        if hr != S_OK || store.is_null() {
+            return String::new();
+        }
+        let store_vtbl = *(store as *mut *const IPropertyStoreVtbl);
+        let mut pv = PROPVARIANT {
+            vt: 0,
+            _reserved1: 0,
+            _reserved2: 0,
+            _reserved3: 0,
+            val: ptr::null_mut(),
+            _val_tail: ptr::null_mut(),
+        };
+        let hr = ((*store_vtbl).GetValue)(store, &PKEY_Device_FriendlyName, &mut pv);
+        let name = if hr == S_OK && pv.vt == VT_LPWSTR {
+            wide_to_string(pv.val)
+        } else {
+            String::new()
+        };
+        // Free the PROPVARIANT's owned string regardless of VT (no-op on the
+        // empty/error case) then release the store.
+        let _ = (l.PropVariantClear)(&mut pv);
+        com_release(store);
+        name
     }
-    let store_vtbl = *(store as *mut *const IPropertyStoreVtbl);
-    let mut pv = PROPVARIANT {
-        vt: 0,
-        _reserved1: 0,
-        _reserved2: 0,
-        _reserved3: 0,
-        val: ptr::null_mut(),
-        _val_tail: ptr::null_mut(),
-    };
-    let hr = ((*store_vtbl).GetValue)(store, &PKEY_Device_FriendlyName, &mut pv);
-    let name = if hr == S_OK && pv.vt == VT_LPWSTR {
-        wide_to_string(pv.val)
-    } else {
-        String::new()
-    };
-    // Free the PROPVARIANT's owned string regardless of VT (no-op on the
-    // empty/error case) then release the store.
-    let _ = (l.PropVariantClear)(&mut pv);
-    com_release(store);
-    name
 }
 
 /// Endpoint id string (`IMMDevice::GetId`, CoTaskMem-allocated LPWSTR)
 /// copied into an owned `String`; frees the COM allocation. Empty on
 /// failure.
 unsafe fn device_id_string(l: &WinLibs, device: *mut c_void) -> String {
-    let device_vtbl = *(device as *mut *const IMMDeviceVtbl);
-    let mut pid: *mut u16 = ptr::null_mut();
-    let hr = ((*device_vtbl).GetId)(device, &mut pid);
-    if hr != S_OK || pid.is_null() {
-        return String::new();
+    unsafe {
+        let device_vtbl = *(device as *mut *const IMMDeviceVtbl);
+        let mut pid: *mut u16 = ptr::null_mut();
+        let hr = ((*device_vtbl).GetId)(device, &mut pid);
+        if hr != S_OK || pid.is_null() {
+            return String::new();
+        }
+        let s = wide_to_string(pid);
+        (l.CoTaskMemFree)(pid as *mut c_void);
+        s
     }
-    let s = wide_to_string(pid);
-    (l.CoTaskMemFree)(pid as *mut c_void);
-    s
 }
 
 /// Enumerate active render (output) endpoints, labeling each with its
 /// friendly name and tagging the default. Reuses the same
 /// `IMMDeviceEnumerator` the open path uses.
 unsafe fn enumerate_output_devices(l: &WinLibs) -> Result<Vec<Device>> {
-    co_init(l);
+    unsafe {
+        co_init(l);
 
-    let mut enumer: *mut c_void = ptr::null_mut();
-    let hr = (l.CoCreateInstance)(
-        &CLSID_MMDeviceEnumerator,
-        ptr::null_mut(),
-        CLSCTX_ALL,
-        &IID_IMMDeviceEnumerator,
-        &mut enumer,
-    );
-    if hr != S_OK || enumer.is_null() {
-        (l.CoUninitialize)();
-        return Err(Error::Runtime {
-            backend: "wasapi",
-            detail: format!("CoCreateInstance(MMDeviceEnumerator) HRESULT=0x{hr:08X}"),
-        });
-    }
-    let enumer_vtbl = *(enumer as *mut *const IMMDeviceEnumeratorVtbl);
-
-    // Default endpoint id (best-effort) so we can tag the matching entry.
-    let mut default_dev: *mut c_void = ptr::null_mut();
-    let default_id = {
-        let hr =
-            ((*enumer_vtbl).GetDefaultAudioEndpoint)(enumer, eRender, eConsole, &mut default_dev);
-        if hr == S_OK && !default_dev.is_null() {
-            let id = device_id_string(l, default_dev);
-            com_release(default_dev);
-            id
-        } else {
-            String::new()
+        let mut enumer: *mut c_void = ptr::null_mut();
+        let hr = (l.CoCreateInstance)(
+            &CLSID_MMDeviceEnumerator,
+            ptr::null_mut(),
+            CLSCTX_ALL,
+            &IID_IMMDeviceEnumerator,
+            &mut enumer,
+        );
+        if hr != S_OK || enumer.is_null() {
+            (l.CoUninitialize)();
+            return Err(Error::Runtime {
+                backend: "wasapi",
+                detail: format!("CoCreateInstance(MMDeviceEnumerator) HRESULT=0x{hr:08X}"),
+            });
         }
-    };
+        let enumer_vtbl = *(enumer as *mut *const IMMDeviceEnumeratorVtbl);
 
-    let mut collection: *mut c_void = ptr::null_mut();
-    let hr =
-        ((*enumer_vtbl).EnumAudioEndpoints)(enumer, eRender, DEVICE_STATE_ACTIVE, &mut collection);
-    if hr != S_OK || collection.is_null() {
+        // Default endpoint id (best-effort) so we can tag the matching entry.
+        let mut default_dev: *mut c_void = ptr::null_mut();
+        let default_id = {
+            let hr = ((*enumer_vtbl).GetDefaultAudioEndpoint)(
+                enumer,
+                eRender,
+                eConsole,
+                &mut default_dev,
+            );
+            if hr == S_OK && !default_dev.is_null() {
+                let id = device_id_string(l, default_dev);
+                com_release(default_dev);
+                id
+            } else {
+                String::new()
+            }
+        };
+
+        let mut collection: *mut c_void = ptr::null_mut();
+        let hr = ((*enumer_vtbl).EnumAudioEndpoints)(
+            enumer,
+            eRender,
+            DEVICE_STATE_ACTIVE,
+            &mut collection,
+        );
+        if hr != S_OK || collection.is_null() {
+            com_release(enumer);
+            (l.CoUninitialize)();
+            return Err(Error::Runtime {
+                backend: "wasapi",
+                detail: format!("EnumAudioEndpoints HRESULT=0x{hr:08X}"),
+            });
+        }
         com_release(enumer);
-        (l.CoUninitialize)();
-        return Err(Error::Runtime {
-            backend: "wasapi",
-            detail: format!("EnumAudioEndpoints HRESULT=0x{hr:08X}"),
-        });
-    }
-    com_release(enumer);
 
-    let coll_vtbl = *(collection as *mut *const IMMDeviceCollectionVtbl);
-    let mut count: u32 = 0;
-    let hr = ((*coll_vtbl).GetCount)(collection, &mut count);
-    if hr != S_OK {
+        let coll_vtbl = *(collection as *mut *const IMMDeviceCollectionVtbl);
+        let mut count: u32 = 0;
+        let hr = ((*coll_vtbl).GetCount)(collection, &mut count);
+        if hr != S_OK {
+            com_release(collection);
+            (l.CoUninitialize)();
+            return Err(Error::Runtime {
+                backend: "wasapi",
+                detail: format!("IMMDeviceCollection::GetCount HRESULT=0x{hr:08X}"),
+            });
+        }
+
+        let mut out = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let mut dev: *mut c_void = ptr::null_mut();
+            let hr = ((*coll_vtbl).Item)(collection, i, &mut dev);
+            if hr != S_OK || dev.is_null() {
+                continue;
+            }
+            let id = device_id_string(l, dev);
+            let name = device_friendly_name(l, dev);
+            com_release(dev);
+            let is_default = !default_id.is_empty() && id == default_id;
+            out.push(Device {
+                id,
+                name,
+                is_default,
+            });
+        }
+
         com_release(collection);
         (l.CoUninitialize)();
-        return Err(Error::Runtime {
-            backend: "wasapi",
-            detail: format!("IMMDeviceCollection::GetCount HRESULT=0x{hr:08X}"),
-        });
+        Ok(out)
     }
-
-    let mut out = Vec::with_capacity(count as usize);
-    for i in 0..count {
-        let mut dev: *mut c_void = ptr::null_mut();
-        let hr = ((*coll_vtbl).Item)(collection, i, &mut dev);
-        if hr != S_OK || dev.is_null() {
-            continue;
-        }
-        let id = device_id_string(l, dev);
-        let name = device_friendly_name(l, dev);
-        com_release(dev);
-        let is_default = !default_id.is_empty() && id == default_id;
-        out.push(Device {
-            id,
-            name,
-            is_default,
-        });
-    }
-
-    com_release(collection);
-    (l.CoUninitialize)();
-    Ok(out)
 }
 
 /// Resolve IMMDeviceEnumerator → endpoint → IAudioClient and its mix
@@ -738,101 +749,105 @@ unsafe fn activate_client(
     l: &WinLibs,
     device_id: Option<&str>,
 ) -> Result<(*mut c_void, *mut WAVEFORMATEX)> {
-    // 1. CoCreateInstance(CLSID_MMDeviceEnumerator, …, IID_IMMDeviceEnumerator)
-    let mut enumer: *mut c_void = ptr::null_mut();
-    let hr = (l.CoCreateInstance)(
-        &CLSID_MMDeviceEnumerator,
-        ptr::null_mut(),
-        CLSCTX_ALL,
-        &IID_IMMDeviceEnumerator,
-        &mut enumer,
-    );
-    if hr != S_OK || enumer.is_null() {
-        return Err(Error::DeviceOpen {
-            backend: "wasapi",
-            detail: format!("CoCreateInstance(MMDeviceEnumerator) HRESULT=0x{hr:08X}"),
-        });
-    }
-
-    // 2. Resolve an endpoint pointer. Default path is
-    //    `GetDefaultAudioEndpoint(eRender=0, eConsole=0)`; the
-    //    explicit-device path is `GetDevice(LPCWSTR id)`.
-    let enumer_vtbl = *(enumer as *mut *const IMMDeviceEnumeratorVtbl);
-    let mut device: *mut c_void = ptr::null_mut();
-    let hr = match device_id {
-        None => ((*enumer_vtbl).GetDefaultAudioEndpoint)(enumer, 0, 0, &mut device),
-        Some(id) => {
-            // LPCWSTR — UTF-16 with NUL terminator.
-            let wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
-            ((*enumer_vtbl).GetDevice)(enumer, wide.as_ptr(), &mut device)
+    unsafe {
+        // 1. CoCreateInstance(CLSID_MMDeviceEnumerator, …, IID_IMMDeviceEnumerator)
+        let mut enumer: *mut c_void = ptr::null_mut();
+        let hr = (l.CoCreateInstance)(
+            &CLSID_MMDeviceEnumerator,
+            ptr::null_mut(),
+            CLSCTX_ALL,
+            &IID_IMMDeviceEnumerator,
+            &mut enumer,
+        );
+        if hr != S_OK || enumer.is_null() {
+            return Err(Error::DeviceOpen {
+                backend: "wasapi",
+                detail: format!("CoCreateInstance(MMDeviceEnumerator) HRESULT=0x{hr:08X}"),
+            });
         }
-    };
-    if hr != S_OK || device.is_null() {
-        com_release(enumer);
-        let api = if device_id.is_some() {
-            "IMMDeviceEnumerator::GetDevice"
-        } else {
-            "GetDefaultAudioEndpoint"
+
+        // 2. Resolve an endpoint pointer. Default path is
+        //    `GetDefaultAudioEndpoint(eRender=0, eConsole=0)`; the
+        //    explicit-device path is `GetDevice(LPCWSTR id)`.
+        let enumer_vtbl = *(enumer as *mut *const IMMDeviceEnumeratorVtbl);
+        let mut device: *mut c_void = ptr::null_mut();
+        let hr = match device_id {
+            None => ((*enumer_vtbl).GetDefaultAudioEndpoint)(enumer, 0, 0, &mut device),
+            Some(id) => {
+                // LPCWSTR — UTF-16 with NUL terminator.
+                let wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
+                ((*enumer_vtbl).GetDevice)(enumer, wide.as_ptr(), &mut device)
+            }
         };
-        return Err(Error::DeviceOpen {
-            backend: "wasapi",
-            detail: format!("{api} HRESULT=0x{hr:08X}"),
-        });
-    }
-    com_release(enumer);
+        if hr != S_OK || device.is_null() {
+            com_release(enumer);
+            let api = if device_id.is_some() {
+                "IMMDeviceEnumerator::GetDevice"
+            } else {
+                "GetDefaultAudioEndpoint"
+            };
+            return Err(Error::DeviceOpen {
+                backend: "wasapi",
+                detail: format!("{api} HRESULT=0x{hr:08X}"),
+            });
+        }
+        com_release(enumer);
 
-    // 3. IMMDevice::Activate(IID_IAudioClient, CLSCTX_ALL, null, &pClient)
-    let device_vtbl = *(device as *mut *const IMMDeviceVtbl);
-    let mut client: *mut c_void = ptr::null_mut();
-    let hr = ((*device_vtbl).Activate)(
-        device,
-        &IID_IAudioClient,
-        CLSCTX_ALL,
-        ptr::null_mut(),
-        &mut client,
-    );
-    com_release(device);
-    if hr != S_OK || client.is_null() {
-        return Err(Error::DeviceOpen {
-            backend: "wasapi",
-            detail: format!("IMMDevice::Activate HRESULT=0x{hr:08X}"),
-        });
-    }
+        // 3. IMMDevice::Activate(IID_IAudioClient, CLSCTX_ALL, null, &pClient)
+        let device_vtbl = *(device as *mut *const IMMDeviceVtbl);
+        let mut client: *mut c_void = ptr::null_mut();
+        let hr = ((*device_vtbl).Activate)(
+            device,
+            &IID_IAudioClient,
+            CLSCTX_ALL,
+            ptr::null_mut(),
+            &mut client,
+        );
+        com_release(device);
+        if hr != S_OK || client.is_null() {
+            return Err(Error::DeviceOpen {
+                backend: "wasapi",
+                detail: format!("IMMDevice::Activate HRESULT=0x{hr:08X}"),
+            });
+        }
 
-    // 4. IAudioClient::GetMixFormat(&pwfx)
-    let client_vtbl = *(client as *mut *const IAudioClientVtbl);
-    let mut pwfx: *mut WAVEFORMATEX = ptr::null_mut();
-    let hr = ((*client_vtbl).GetMixFormat)(client, &mut pwfx);
-    if hr != S_OK || pwfx.is_null() {
-        com_release(client);
-        return Err(Error::DeviceOpen {
-            backend: "wasapi",
-            detail: format!("GetMixFormat HRESULT=0x{hr:08X}"),
-        });
+        // 4. IAudioClient::GetMixFormat(&pwfx)
+        let client_vtbl = *(client as *mut *const IAudioClientVtbl);
+        let mut pwfx: *mut WAVEFORMATEX = ptr::null_mut();
+        let hr = ((*client_vtbl).GetMixFormat)(client, &mut pwfx);
+        if hr != S_OK || pwfx.is_null() {
+            com_release(client);
+            return Err(Error::DeviceOpen {
+                backend: "wasapi",
+                detail: format!("GetMixFormat HRESULT=0x{hr:08X}"),
+            });
+        }
+        Ok((client, pwfx))
     }
-    Ok((client, pwfx))
 }
 
 /// Read the effective sample format out of a WAVEFORMATEX (handling
 /// WAVEFORMATEXTENSIBLE's SubFormat GUID). Returns (is_float, bits).
 unsafe fn inspect_format(pwfx: *const WAVEFORMATEX) -> Option<(bool, u16)> {
-    let tag = (*pwfx).wFormatTag;
-    let bits = (*pwfx).wBitsPerSample;
-    match tag {
-        WAVE_FORMAT_IEEE_FLOAT => Some((true, bits)),
-        WAVE_FORMAT_PCM => Some((false, bits)),
-        WAVE_FORMAT_EXTENSIBLE => {
-            let ext = pwfx as *const WAVEFORMATEXTENSIBLE;
-            let sub = (*ext).SubFormat;
-            if sub == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT {
-                Some((true, bits))
-            } else if sub == KSDATAFORMAT_SUBTYPE_PCM {
-                Some((false, bits))
-            } else {
-                None
+    unsafe {
+        let tag = (*pwfx).wFormatTag;
+        let bits = (*pwfx).wBitsPerSample;
+        match tag {
+            WAVE_FORMAT_IEEE_FLOAT => Some((true, bits)),
+            WAVE_FORMAT_PCM => Some((false, bits)),
+            WAVE_FORMAT_EXTENSIBLE => {
+                let ext = pwfx as *const WAVEFORMATEXTENSIBLE;
+                let sub = (*ext).SubFormat;
+                if sub == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT {
+                    Some((true, bits))
+                } else if sub == KSDATAFORMAT_SUBTYPE_PCM {
+                    Some((false, bits))
+                } else {
+                    None
+                }
             }
+            _ => None,
         }
-        _ => None,
     }
 }
 
@@ -879,204 +894,207 @@ unsafe fn open_inner(
     req: StreamRequest,
     cb: Callback,
 ) -> Result<Box<dyn StreamImpl>> {
-    co_init(&l);
-    let (client, pwfx) = activate_client(&l, req.device.as_deref())?;
-    let channels = (*pwfx).nChannels;
-    let sample_rate = (*pwfx).nSamplesPerSec;
-    let (is_float, bits) = match inspect_format(pwfx) {
-        Some(v) => v,
-        None => {
+    unsafe {
+        co_init(&l);
+        let (client, pwfx) = activate_client(&l, req.device.as_deref())?;
+        let channels = (*pwfx).nChannels;
+        let sample_rate = (*pwfx).nSamplesPerSec;
+        let (is_float, bits) = match inspect_format(pwfx) {
+            Some(v) => v,
+            None => {
+                (l.CoTaskMemFree)(pwfx as *mut c_void);
+                com_release(client);
+                return Err(Error::UnsupportedFormat {
+                    backend: "wasapi",
+                    detail: "mix format is neither IEEE_FLOAT nor PCM".into(),
+                });
+            }
+        };
+        // We only handle f32 and s16 in the worker. Anything else → bail
+        // rather than produce mangled audio.
+        let is_f32 = is_float && bits == 32;
+        let is_s16 = !is_float && bits == 16;
+        if !is_f32 && !is_s16 {
             (l.CoTaskMemFree)(pwfx as *mut c_void);
             com_release(client);
             return Err(Error::UnsupportedFormat {
                 backend: "wasapi",
-                detail: "mix format is neither IEEE_FLOAT nor PCM".into(),
+                detail: format!("mix format bits_per_sample={bits} is_float={is_float}"),
             });
         }
-    };
-    // We only handle f32 and s16 in the worker. Anything else → bail
-    // rather than produce mangled audio.
-    let is_f32 = is_float && bits == 32;
-    let is_s16 = !is_float && bits == 16;
-    if !is_f32 && !is_s16 {
+
+        // Honour `StreamRequest::buffer_frames` as a hint: convert frames
+        // at the device's sample rate into the REFERENCE_TIME (100 ns)
+        // units `IAudioClient::Initialize` consumes. When the caller leaves
+        // the hint as `None` we fall back to the historical ~200 ms target;
+        // WASAPI will clamp either value to the device's minimum period
+        // internally so the request is always advisory.
+        let buffer_duration: REFERENCE_TIME =
+            buffer_duration_ref_time(req.buffer_frames, sample_rate);
+
+        let client_vtbl = *(client as *mut *const IAudioClientVtbl);
+        let hr = ((*client_vtbl).Initialize)(
+            client,
+            AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            buffer_duration,
+            0,
+            pwfx,
+            ptr::null(),
+        );
         (l.CoTaskMemFree)(pwfx as *mut c_void);
-        com_release(client);
-        return Err(Error::UnsupportedFormat {
-            backend: "wasapi",
-            detail: format!("mix format bits_per_sample={bits} is_float={is_float}"),
-        });
-    }
+        if hr != S_OK {
+            com_release(client);
+            return Err(Error::DeviceOpen {
+                backend: "wasapi",
+                detail: format!("IAudioClient::Initialize HRESULT=0x{hr:08X}"),
+            });
+        }
 
-    // Honour `StreamRequest::buffer_frames` as a hint: convert frames
-    // at the device's sample rate into the REFERENCE_TIME (100 ns)
-    // units `IAudioClient::Initialize` consumes. When the caller leaves
-    // the hint as `None` we fall back to the historical ~200 ms target;
-    // WASAPI will clamp either value to the device's minimum period
-    // internally so the request is always advisory.
-    let buffer_duration: REFERENCE_TIME = buffer_duration_ref_time(req.buffer_frames, sample_rate);
+        // Event handle — auto-reset so we block exactly once per buffer fill.
+        let event = (l.CreateEventA)(ptr::null_mut(), 0, 0, ptr::null());
+        if event.is_null() {
+            com_release(client);
+            return Err(Error::DeviceOpen {
+                backend: "wasapi",
+                detail: "CreateEventA returned NULL".into(),
+            });
+        }
+        let hr = ((*client_vtbl).SetEventHandle)(client, event);
+        if hr != S_OK {
+            (l.CloseHandle)(event);
+            com_release(client);
+            return Err(Error::DeviceOpen {
+                backend: "wasapi",
+                detail: format!("SetEventHandle HRESULT=0x{hr:08X}"),
+            });
+        }
 
-    let client_vtbl = *(client as *mut *const IAudioClientVtbl);
-    let hr = ((*client_vtbl).Initialize)(
-        client,
-        AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-        buffer_duration,
-        0,
-        pwfx,
-        ptr::null(),
-    );
-    (l.CoTaskMemFree)(pwfx as *mut c_void);
-    if hr != S_OK {
-        com_release(client);
-        return Err(Error::DeviceOpen {
-            backend: "wasapi",
-            detail: format!("IAudioClient::Initialize HRESULT=0x{hr:08X}"),
-        });
-    }
+        let mut buffer_frames: u32 = 0;
+        let hr = ((*client_vtbl).GetBufferSize)(client, &mut buffer_frames);
+        if hr != S_OK {
+            (l.CloseHandle)(event);
+            com_release(client);
+            return Err(Error::DeviceOpen {
+                backend: "wasapi",
+                detail: format!("GetBufferSize HRESULT=0x{hr:08X}"),
+            });
+        }
 
-    // Event handle — auto-reset so we block exactly once per buffer fill.
-    let event = (l.CreateEventA)(ptr::null_mut(), 0, 0, ptr::null());
-    if event.is_null() {
-        com_release(client);
-        return Err(Error::DeviceOpen {
-            backend: "wasapi",
-            detail: "CreateEventA returned NULL".into(),
-        });
-    }
-    let hr = ((*client_vtbl).SetEventHandle)(client, event);
-    if hr != S_OK {
-        (l.CloseHandle)(event);
-        com_release(client);
-        return Err(Error::DeviceOpen {
-            backend: "wasapi",
-            detail: format!("SetEventHandle HRESULT=0x{hr:08X}"),
-        });
-    }
+        let mut render: *mut c_void = ptr::null_mut();
+        let hr = ((*client_vtbl).GetService)(client, &IID_IAudioRenderClient, &mut render);
+        if hr != S_OK || render.is_null() {
+            (l.CloseHandle)(event);
+            com_release(client);
+            return Err(Error::DeviceOpen {
+                backend: "wasapi",
+                detail: format!("GetService(IAudioRenderClient) HRESULT=0x{hr:08X}"),
+            });
+        }
 
-    let mut buffer_frames: u32 = 0;
-    let hr = ((*client_vtbl).GetBufferSize)(client, &mut buffer_frames);
-    if hr != S_OK {
-        (l.CloseHandle)(event);
-        com_release(client);
-        return Err(Error::DeviceOpen {
-            backend: "wasapi",
-            detail: format!("GetBufferSize HRESULT=0x{hr:08X}"),
-        });
-    }
+        let hr = ((*client_vtbl).Start)(client);
+        if hr != S_OK {
+            com_release(render);
+            (l.CloseHandle)(event);
+            com_release(client);
+            return Err(Error::DeviceOpen {
+                backend: "wasapi",
+                detail: format!("IAudioClient::Start HRESULT=0x{hr:08X}"),
+            });
+        }
 
-    let mut render: *mut c_void = ptr::null_mut();
-    let hr = ((*client_vtbl).GetService)(client, &IID_IAudioRenderClient, &mut render);
-    if hr != S_OK || render.is_null() {
-        (l.CloseHandle)(event);
-        com_release(client);
-        return Err(Error::DeviceOpen {
-            backend: "wasapi",
-            detail: format!("GetService(IAudioRenderClient) HRESULT=0x{hr:08X}"),
-        });
-    }
+        // GetStreamLatency is stable after Initialize — reports the
+        // driver/hardware-side delay in REFERENCE_TIME (100 ns units).
+        // Over Bluetooth this includes the A2DP round-trip.
+        let mut stream_latency_refs: REFERENCE_TIME = 0;
+        let _ = ((*client_vtbl).GetStreamLatency)(client, &mut stream_latency_refs);
+        let stream_latency_ns = (stream_latency_refs.max(0) as u64) * 100;
 
-    let hr = ((*client_vtbl).Start)(client);
-    if hr != S_OK {
-        com_release(render);
-        (l.CloseHandle)(event);
-        com_release(client);
-        return Err(Error::DeviceOpen {
-            backend: "wasapi",
-            detail: format!("IAudioClient::Start HRESULT=0x{hr:08X}"),
-        });
-    }
-
-    // GetStreamLatency is stable after Initialize — reports the
-    // driver/hardware-side delay in REFERENCE_TIME (100 ns units).
-    // Over Bluetooth this includes the A2DP round-trip.
-    let mut stream_latency_refs: REFERENCE_TIME = 0;
-    let _ = ((*client_vtbl).GetStreamLatency)(client, &mut stream_latency_refs);
-    let stream_latency_ns = (stream_latency_refs.max(0) as u64) * 100;
-
-    // Optional `IAudioClock` for live total-pipeline latency. The
-    // call can legitimately fail on driver shims that don't bother
-    // implementing it; graceful degradation: `latency()` falls back
-    // to `stream_latency_ns + padding`. `frequency = 0` is treated
-    // the same as a failed GetService (no live clock available) — we
-    // can't divide by zero, and a 0-frequency clock is meaningless.
-    let mut clock: *mut c_void = ptr::null_mut();
-    let hr = ((*client_vtbl).GetService)(client, &IID_IAudioClock, &mut clock);
-    let (clock_ptr, clock_frequency) = if hr == S_OK && !clock.is_null() {
-        let clock_vtbl = *(clock as *mut *const IAudioClockVtbl);
-        let mut freq: u64 = 0;
-        let hr_freq = ((*clock_vtbl).GetFrequency)(clock, &mut freq);
-        if hr_freq == S_OK && freq != 0 {
-            (clock, freq)
+        // Optional `IAudioClock` for live total-pipeline latency. The
+        // call can legitimately fail on driver shims that don't bother
+        // implementing it; graceful degradation: `latency()` falls back
+        // to `stream_latency_ns + padding`. `frequency = 0` is treated
+        // the same as a failed GetService (no live clock available) — we
+        // can't divide by zero, and a 0-frequency clock is meaningless.
+        let mut clock: *mut c_void = ptr::null_mut();
+        let hr = ((*client_vtbl).GetService)(client, &IID_IAudioClock, &mut clock);
+        let (clock_ptr, clock_frequency) = if hr == S_OK && !clock.is_null() {
+            let clock_vtbl = *(clock as *mut *const IAudioClockVtbl);
+            let mut freq: u64 = 0;
+            let hr_freq = ((*clock_vtbl).GetFrequency)(clock, &mut freq);
+            if hr_freq == S_OK && freq != 0 {
+                (clock, freq)
+            } else {
+                com_release(clock);
+                (ptr::null_mut(), 0)
+            }
         } else {
-            com_release(clock);
+            if !clock.is_null() {
+                com_release(clock);
+            }
             (ptr::null_mut(), 0)
-        }
-    } else {
-        if !clock.is_null() {
-            com_release(clock);
-        }
-        (ptr::null_mut(), 0)
-    };
+        };
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let paused = Arc::new(AtomicBool::new(false));
-    let frames_played = Arc::new(AtomicU64::new(0));
-    // Latest GetCurrentPadding in frames — read by the worker and
-    // published for `latency()`.
-    let padding_frames = Arc::new(AtomicU64::new(0));
-    // Latest IAudioClock-derived end-to-end output latency in
-    // nanoseconds (mix engine + driver + endpoint hardware). Stays at
-    // its initial sentinel value `u64::MAX` until the worker has been
-    // able to publish a meaningful figure (i.e. some audio has played
-    // and the position advanced); `latency()` treats the sentinel as
-    // "no live reading yet" and falls back to the static estimate.
-    let clock_latency_ns = Arc::new(AtomicU64::new(u64::MAX));
+        let stop = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
+        let frames_played = Arc::new(AtomicU64::new(0));
+        // Latest GetCurrentPadding in frames — read by the worker and
+        // published for `latency()`.
+        let padding_frames = Arc::new(AtomicU64::new(0));
+        // Latest IAudioClock-derived end-to-end output latency in
+        // nanoseconds (mix engine + driver + endpoint hardware). Stays at
+        // its initial sentinel value `u64::MAX` until the worker has been
+        // able to publish a meaningful figure (i.e. some audio has played
+        // and the position advanced); `latency()` treats the sentinel as
+        // "no live reading yet" and falls back to the static estimate.
+        let clock_latency_ns = Arc::new(AtomicU64::new(u64::MAX));
 
-    let state = WasapiWorkerState {
-        lib: l.clone(),
-        client: ComPtr(client),
-        render: ComPtr(render),
-        event: HandlePtr(event),
-        clock: ComPtr(clock_ptr),
-        clock_frequency,
-        buffer_frames,
-        channels: channels as usize,
-        sample_rate,
-        is_f32,
-        stop: stop.clone(),
-        paused: paused.clone(),
-        frames_played: frames_played.clone(),
-        padding_frames: padding_frames.clone(),
-        clock_latency_ns: clock_latency_ns.clone(),
-        cb,
-    };
-
-    let thread = std::thread::Builder::new()
-        .name("oxideav-sysaudio-wasapi".into())
-        .spawn(move || state.run())
-        .map_err(|e| Error::Runtime {
-            backend: "wasapi",
-            detail: format!("spawn worker: {e}"),
-        })?;
-
-    Ok(Box::new(WasapiStream {
-        lib: l,
-        client: ComPtr(client),
-        render: ComPtr(render),
-        event: HandlePtr(event),
-        clock: ComPtr(clock_ptr),
-        stop,
-        paused,
-        thread: Some(thread),
-        padding_frames,
-        clock_latency_ns,
-        stream_latency_ns,
-        format: StreamFormat {
+        let state = WasapiWorkerState {
+            lib: l.clone(),
+            client: ComPtr(client),
+            render: ComPtr(render),
+            event: HandlePtr(event),
+            clock: ComPtr(clock_ptr),
+            clock_frequency,
+            buffer_frames,
+            channels: channels as usize,
             sample_rate,
-            channels,
-            format: SampleFormat::F32,
-        },
-    }))
+            is_f32,
+            stop: stop.clone(),
+            paused: paused.clone(),
+            frames_played: frames_played.clone(),
+            padding_frames: padding_frames.clone(),
+            clock_latency_ns: clock_latency_ns.clone(),
+            cb,
+        };
+
+        let thread = std::thread::Builder::new()
+            .name("oxideav-sysaudio-wasapi".into())
+            .spawn(move || state.run())
+            .map_err(|e| Error::Runtime {
+                backend: "wasapi",
+                detail: format!("spawn worker: {e}"),
+            })?;
+
+        Ok(Box::new(WasapiStream {
+            lib: l,
+            client: ComPtr(client),
+            render: ComPtr(render),
+            event: HandlePtr(event),
+            clock: ComPtr(clock_ptr),
+            stop,
+            paused,
+            thread: Some(thread),
+            padding_frames,
+            clock_latency_ns,
+            stream_latency_ns,
+            format: StreamFormat {
+                sample_rate,
+                channels,
+                format: SampleFormat::F32,
+            },
+        }))
+    }
 }
 
 #[derive(Copy, Clone)]

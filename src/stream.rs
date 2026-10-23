@@ -5,12 +5,12 @@
 //! drives the callback from a worker thread (ALSA, PulseAudio) or from
 //! an OS-owned audio thread (CoreAudio, WASAPI).
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use crate::format::StreamFormat;
 use crate::Result;
+use crate::format::StreamFormat;
 
 /// Internal per-backend stream implementation. Not public — the public
 /// surface is [`Stream`] which type-erases this.

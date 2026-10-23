@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use oxideav_sysaudio::{
-    driver_by_name, drivers, mock, open, open_on, probe, Device, Driver, Error, SampleFormat,
-    StreamRequest,
+    Device, Driver, Error, SampleFormat, StreamRequest, driver_by_name, drivers, mock, open,
+    open_on, probe,
 };
 
 fn mock_driver() -> Driver {
@@ -253,11 +253,7 @@ fn latency_models_two_periods() {
     let s = open(mock_driver(), req, |_, _| {}).expect("mock open");
     let lat = s.latency().expect("mock reports latency");
     let expect = Duration::from_secs_f64(2.0 * 240.0 / 48_000.0);
-    let diff = if lat > expect {
-        lat - expect
-    } else {
-        expect - lat
-    };
+    let diff = lat.abs_diff(expect);
     assert!(
         diff < Duration::from_micros(100),
         "latency {lat:?}, expected ~{expect:?}"

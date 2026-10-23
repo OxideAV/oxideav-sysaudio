@@ -1,7 +1,7 @@
 // Smoke test — play a 440 Hz sine for 1.5 s via probe()'s top pick.
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 fn main() {

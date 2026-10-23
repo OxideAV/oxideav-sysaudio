@@ -17,7 +17,7 @@
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 
-use std::ffi::{c_char, c_int, c_uint, c_void, CString};
+use std::ffi::{CString, c_char, c_int, c_uint, c_void};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;

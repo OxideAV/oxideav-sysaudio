@@ -386,8 +386,8 @@ pub fn open<F>(driver: Driver, req: StreamRequest, cb: F) -> Result<Stream>
 where
     F: FnMut(&mut [f32], &CallbackInfo) + Send + 'static,
 {
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     validate_request(driver.inner.name(), &req)?;
     // Software volume: the gain lives in an atomic shared between the

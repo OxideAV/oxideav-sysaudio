@@ -10,7 +10,7 @@
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 
-use std::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void, CStr, CString};
+use std::ffi::{CStr, CString, c_char, c_int, c_long, c_uint, c_ulong, c_void};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -316,16 +316,18 @@ impl AlsaLib {
     /// libasound-malloc'd buffer. Returns `None` when the key is absent
     /// (ALSA returns NULL — e.g. IOID is NULL for a duplex device).
     unsafe fn get_hint(&self, hint: *const c_void, key: &CStr) -> Option<String> {
-        let get = self.snd_device_name_get_hint?;
-        let raw = get(hint, key.as_ptr());
-        if raw.is_null() {
-            return None;
+        unsafe {
+            let get = self.snd_device_name_get_hint?;
+            let raw = get(hint, key.as_ptr());
+            if raw.is_null() {
+                return None;
+            }
+            let owned = CStr::from_ptr(raw).to_string_lossy().into_owned();
+            if let Some(free) = self.free_fn {
+                free(raw as *mut c_void);
+            }
+            Some(owned)
         }
-        let owned = CStr::from_ptr(raw).to_string_lossy().into_owned();
-        if let Some(free) = self.free_fn {
-            free(raw as *mut c_void);
-        }
-        Some(owned)
     }
 
     /// Enumerate playback PCM devices via the `snd_device_name_hint`
@@ -372,24 +374,22 @@ impl AlsaLib {
                     Some("Output") | None => true,
                     Some(_) => false,
                 };
-                if is_output {
-                    if let Some(name) = self.get_hint(hint, &key_name) {
-                        // DESC's first line is the friendly card label;
-                        // subsequent lines are the long form. Take the
-                        // first line, fall back to NAME if DESC absent.
-                        let desc = self.get_hint(hint, &key_desc);
-                        let friendly = desc
-                            .as_deref()
-                            .and_then(|d| d.lines().next())
-                            .unwrap_or(&name)
-                            .to_string();
-                        let is_default = name == "default";
-                        out.push(Device {
-                            id: name,
-                            name: friendly,
-                            is_default,
-                        });
-                    }
+                if is_output && let Some(name) = self.get_hint(hint, &key_name) {
+                    // DESC's first line is the friendly card label;
+                    // subsequent lines are the long form. Take the
+                    // first line, fall back to NAME if DESC absent.
+                    let desc = self.get_hint(hint, &key_desc);
+                    let friendly = desc
+                        .as_deref()
+                        .and_then(|d| d.lines().next())
+                        .unwrap_or(&name)
+                        .to_string();
+                    let is_default = name == "default";
+                    out.push(Device {
+                        id: name,
+                        name: friendly,
+                        is_default,
+                    });
                 }
                 p = p.add(1);
             }
@@ -528,72 +528,74 @@ impl Backend for AlsaBackend {
 /// guard for the hw_params allocation so every error path releases it
 /// before unwinding to `preferred_format`'s `snd_pcm_close`.
 unsafe fn preferred_format_inner(l: &AlsaLib, pcm: *mut snd_pcm_t) -> Result<StreamFormat> {
-    struct LocalHwGuard<'a> {
-        l: &'a AlsaLib,
-        hw: *mut snd_pcm_hw_params_t,
-    }
-    impl<'a> Drop for LocalHwGuard<'a> {
-        fn drop(&mut self) {
-            unsafe { (self.l.hw_params_free)(self.hw) };
+    unsafe {
+        struct LocalHwGuard<'a> {
+            l: &'a AlsaLib,
+            hw: *mut snd_pcm_hw_params_t,
         }
-    }
+        impl<'a> Drop for LocalHwGuard<'a> {
+            fn drop(&mut self) {
+                unsafe { (self.l.hw_params_free)(self.hw) };
+            }
+        }
 
-    let mut hw: *mut snd_pcm_hw_params_t = ptr::null_mut();
-    let r = (l.hw_params_malloc)(&mut hw);
-    if r < 0 {
-        return Err(Error::DeviceOpen {
-            backend: "alsa",
-            detail: format!("hw_params_malloc: {}", l.strerror(r)),
-        });
-    }
-    let _guard = LocalHwGuard { l, hw };
+        let mut hw: *mut snd_pcm_hw_params_t = ptr::null_mut();
+        let r = (l.hw_params_malloc)(&mut hw);
+        if r < 0 {
+            return Err(Error::DeviceOpen {
+                backend: "alsa",
+                detail: format!("hw_params_malloc: {}", l.strerror(r)),
+            });
+        }
+        let _guard = LocalHwGuard { l, hw };
 
-    // Load the full parameter superset for the device.
-    check(l, (l.hw_params_any)(pcm, hw), "hw_params_any")?;
-    // Sample format — mirror the open path's preference (FLOAT_LE, fall
-    // back to S16_LE). The public callback surface stays F32 either way;
-    // the open path silently converts S16<->F32 for old devices. So the
-    // *reported* format here is always F32 — what we're really probing
-    // for is whether the device will accept the open path at all.
-    let format = if (l.hw_params_set_format)(pcm, hw, SND_PCM_FORMAT_FLOAT_LE) == 0 {
-        SampleFormat::F32
-    } else {
+        // Load the full parameter superset for the device.
+        check(l, (l.hw_params_any)(pcm, hw), "hw_params_any")?;
+        // Sample format — mirror the open path's preference (FLOAT_LE, fall
+        // back to S16_LE). The public callback surface stays F32 either way;
+        // the open path silently converts S16<->F32 for old devices. So the
+        // *reported* format here is always F32 — what we're really probing
+        // for is whether the device will accept the open path at all.
+        let format = if (l.hw_params_set_format)(pcm, hw, SND_PCM_FORMAT_FLOAT_LE) == 0 {
+            SampleFormat::F32
+        } else {
+            check(
+                l,
+                (l.hw_params_set_format)(pcm, hw, SND_PCM_FORMAT_S16_LE),
+                "hw_params_set_format(S16_LE)",
+            )?;
+            SampleFormat::F32
+        };
+        // Channel-count snap — canonical 2 (stereo) hint, let ALSA pull it
+        // into the device's nearest supported count. The symbol is
+        // optional; if libasound is old enough to lack it we keep 2 as the
+        // documented default. Stereo is the common reality and matches the
+        // backend's other clamping (`channels.clamp(1, 8)` on `open`).
+        let mut channels: c_uint = 2;
+        if let Some(set_near) = l.hw_params_set_channels_near {
+            check(
+                l,
+                set_near(pcm, hw, &mut channels),
+                "hw_params_set_channels_near",
+            )?;
+        }
+        // Sample-rate snap — canonical 48 kHz hint, exactly the path the
+        // open() comment in lib.rs documents:
+        // "the rate `snd_pcm_hw_params_set_rate_near` snaps the
+        //  unconstrained request to".
+        let mut rate: c_uint = 48_000;
+        let mut dir: c_int = 0;
         check(
             l,
-            (l.hw_params_set_format)(pcm, hw, SND_PCM_FORMAT_S16_LE),
-            "hw_params_set_format(S16_LE)",
+            (l.hw_params_set_rate_near)(pcm, hw, &mut rate, &mut dir),
+            "hw_params_set_rate_near",
         )?;
-        SampleFormat::F32
-    };
-    // Channel-count snap — canonical 2 (stereo) hint, let ALSA pull it
-    // into the device's nearest supported count. The symbol is
-    // optional; if libasound is old enough to lack it we keep 2 as the
-    // documented default. Stereo is the common reality and matches the
-    // backend's other clamping (`channels.clamp(1, 8)` on `open`).
-    let mut channels: c_uint = 2;
-    if let Some(set_near) = l.hw_params_set_channels_near {
-        check(
-            l,
-            set_near(pcm, hw, &mut channels),
-            "hw_params_set_channels_near",
-        )?;
+        Ok(StreamFormat {
+            sample_rate: rate,
+            channels: channels.clamp(1, u16::MAX as c_uint) as u16,
+            format,
+        })
     }
-    // Sample-rate snap — canonical 48 kHz hint, exactly the path the
-    // open() comment in lib.rs documents:
-    // "the rate `snd_pcm_hw_params_set_rate_near` snaps the
-    //  unconstrained request to".
-    let mut rate: c_uint = 48_000;
-    let mut dir: c_int = 0;
-    check(
-        l,
-        (l.hw_params_set_rate_near)(pcm, hw, &mut rate, &mut dir),
-        "hw_params_set_rate_near",
-    )?;
-    Ok(StreamFormat {
-        sample_rate: rate,
-        channels: channels.clamp(1, u16::MAX as c_uint) as u16,
-        format,
-    })
 }
 
 unsafe fn open_inner(
@@ -601,31 +603,33 @@ unsafe fn open_inner(
     req: StreamRequest,
     cb: Callback,
 ) -> Result<Box<dyn StreamImpl>> {
-    // Honor `req.device` if the caller wants a specific PCM. For ALSA
-    // the enumerated `Device::id` IS the PCM name (`snd_device_name_hint`
-    // returns it under the "NAME" key), so we pass it straight to
-    // `snd_pcm_open`. A NUL byte inside the string would be a malformed
-    // id; reject it as DeviceOpen rather than silently truncating.
-    let pcm_name = req.device.as_deref().unwrap_or("default");
-    let name = CString::new(pcm_name).map_err(|_| Error::DeviceOpen {
-        backend: "alsa",
-        detail: "device id contains an interior NUL byte".into(),
-    })?;
-    let mut pcm: *mut snd_pcm_t = ptr::null_mut();
-    let r = (l.snd_pcm_open)(&mut pcm, name.as_ptr(), SND_PCM_STREAM_PLAYBACK, 0);
-    if r < 0 {
-        return Err(Error::DeviceOpen {
+    unsafe {
+        // Honor `req.device` if the caller wants a specific PCM. For ALSA
+        // the enumerated `Device::id` IS the PCM name (`snd_device_name_hint`
+        // returns it under the "NAME" key), so we pass it straight to
+        // `snd_pcm_open`. A NUL byte inside the string would be a malformed
+        // id; reject it as DeviceOpen rather than silently truncating.
+        let pcm_name = req.device.as_deref().unwrap_or("default");
+        let name = CString::new(pcm_name).map_err(|_| Error::DeviceOpen {
             backend: "alsa",
-            detail: l.strerror(r),
-        });
-    }
-    // From here on, any error path must close pcm.
-    let res = configure_and_spawn(l.clone(), pcm, req, cb);
-    match res {
-        Ok(boxed) => Ok(boxed),
-        Err(e) => {
-            (l.snd_pcm_close)(pcm);
-            Err(e)
+            detail: "device id contains an interior NUL byte".into(),
+        })?;
+        let mut pcm: *mut snd_pcm_t = ptr::null_mut();
+        let r = (l.snd_pcm_open)(&mut pcm, name.as_ptr(), SND_PCM_STREAM_PLAYBACK, 0);
+        if r < 0 {
+            return Err(Error::DeviceOpen {
+                backend: "alsa",
+                detail: l.strerror(r),
+            });
+        }
+        // From here on, any error path must close pcm.
+        let res = configure_and_spawn(l.clone(), pcm, req, cb);
+        match res {
+            Ok(boxed) => Ok(boxed),
+            Err(e) => {
+                (l.snd_pcm_close)(pcm);
+                Err(e)
+            }
         }
     }
 }
@@ -636,121 +640,123 @@ unsafe fn configure_and_spawn(
     req: StreamRequest,
     cb: Callback,
 ) -> Result<Box<dyn StreamImpl>> {
-    let mut hw: *mut snd_pcm_hw_params_t = ptr::null_mut();
-    let r = (l.hw_params_malloc)(&mut hw);
-    if r < 0 {
-        return Err(Error::DeviceOpen {
-            backend: "alsa",
-            detail: format!("hw_params_malloc: {}", l.strerror(r)),
-        });
-    }
-    let hw_guard = HwParamsGuard { l: l.clone(), hw };
+    unsafe {
+        let mut hw: *mut snd_pcm_hw_params_t = ptr::null_mut();
+        let r = (l.hw_params_malloc)(&mut hw);
+        if r < 0 {
+            return Err(Error::DeviceOpen {
+                backend: "alsa",
+                detail: format!("hw_params_malloc: {}", l.strerror(r)),
+            });
+        }
+        let hw_guard = HwParamsGuard { l: l.clone(), hw };
 
-    check(&l, (l.hw_params_any)(pcm, hw), "hw_params_any")?;
-    check(
-        &l,
-        (l.hw_params_set_access)(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED),
-        "hw_params_set_access",
-    )?;
+        check(&l, (l.hw_params_any)(pcm, hw), "hw_params_any")?;
+        check(
+            &l,
+            (l.hw_params_set_access)(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED),
+            "hw_params_set_access",
+        )?;
 
-    // Prefer FLOAT_LE; fall back to S16_LE for devices that don't
-    // advertise float (uncommon on modern drivers, common on embedded).
-    let (device_fmt, device_fmt_is_f32) =
-        match (l.hw_params_set_format)(pcm, hw, SND_PCM_FORMAT_FLOAT_LE) {
-            0 => (SND_PCM_FORMAT_FLOAT_LE, true),
-            _ => {
-                check(
-                    &l,
-                    (l.hw_params_set_format)(pcm, hw, SND_PCM_FORMAT_S16_LE),
-                    "hw_params_set_format(S16_LE)",
-                )?;
-                (SND_PCM_FORMAT_S16_LE, false)
-            }
+        // Prefer FLOAT_LE; fall back to S16_LE for devices that don't
+        // advertise float (uncommon on modern drivers, common on embedded).
+        let (device_fmt, device_fmt_is_f32) =
+            match (l.hw_params_set_format)(pcm, hw, SND_PCM_FORMAT_FLOAT_LE) {
+                0 => (SND_PCM_FORMAT_FLOAT_LE, true),
+                _ => {
+                    check(
+                        &l,
+                        (l.hw_params_set_format)(pcm, hw, SND_PCM_FORMAT_S16_LE),
+                        "hw_params_set_format(S16_LE)",
+                    )?;
+                    (SND_PCM_FORMAT_S16_LE, false)
+                }
+            };
+        let _ = device_fmt;
+
+        let want_ch = req.channels.clamp(1, 8) as c_uint;
+        check(
+            &l,
+            (l.hw_params_set_channels)(pcm, hw, want_ch),
+            "hw_params_set_channels",
+        )?;
+
+        let mut rate = req.sample_rate;
+        let mut dir: c_int = 0;
+        check(
+            &l,
+            (l.hw_params_set_rate_near)(pcm, hw, &mut rate, &mut dir),
+            "hw_params_set_rate_near",
+        )?;
+
+        // Target ~20 ms periods; the caller can ask for something else via
+        // StreamRequest::buffer_frames. 4 periods of headroom keeps us out
+        // of underrun range on loaded systems.
+        let mut period: c_ulong = req
+            .buffer_frames
+            .map(|b| b as c_ulong)
+            .unwrap_or_else(|| (rate as c_ulong / 50).max(64));
+        let mut dir2: c_int = 0;
+        check(
+            &l,
+            (l.hw_params_set_period_size_near)(pcm, hw, &mut period, &mut dir2),
+            "hw_params_set_period_size_near",
+        )?;
+
+        let mut buffer: c_ulong = period.saturating_mul(4);
+        let _ = (l.hw_params_set_buffer_size_near)(pcm, hw, &mut buffer); // best-effort
+
+        check(&l, (l.hw_params)(pcm, hw), "hw_params (commit)")?;
+
+        let mut period_actual: c_ulong = 0;
+        let mut pd: c_int = 0;
+        let _ = (l.hw_params_get_period_size)(hw, &mut period_actual, &mut pd);
+        drop(hw_guard);
+
+        check(&l, (l.snd_pcm_prepare)(pcm), "snd_pcm_prepare")?;
+
+        let period_frames = period_actual.max(period) as usize;
+        let channels = want_ch as usize;
+        let frames_played = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        // Latest `snd_pcm_delay()` reading, in frames. Negative values are
+        // ALSA's "the PCM is ahead of us" which shouldn't happen for
+        // playback; we store i64 to match the sign of snd_pcm_sframes_t.
+        let delay_frames = Arc::new(AtomicI64::new(0));
+
+        let state = AlsaWorkerState {
+            lib: l.clone(),
+            pcm: PcmPtr(pcm),
+            cb,
+            period_frames,
+            channels,
+            device_fmt_is_f32,
+            frames_played: frames_played.clone(),
+            stop: stop.clone(),
+            delay_frames: delay_frames.clone(),
         };
-    let _ = device_fmt;
 
-    let want_ch = req.channels.clamp(1, 8) as c_uint;
-    check(
-        &l,
-        (l.hw_params_set_channels)(pcm, hw, want_ch),
-        "hw_params_set_channels",
-    )?;
+        let thread = std::thread::Builder::new()
+            .name("oxideav-sysaudio-alsa".into())
+            .spawn(move || state.run())
+            .map_err(|e| Error::Runtime {
+                backend: "alsa",
+                detail: format!("spawn worker: {e}"),
+            })?;
 
-    let mut rate = req.sample_rate;
-    let mut dir: c_int = 0;
-    check(
-        &l,
-        (l.hw_params_set_rate_near)(pcm, hw, &mut rate, &mut dir),
-        "hw_params_set_rate_near",
-    )?;
-
-    // Target ~20 ms periods; the caller can ask for something else via
-    // StreamRequest::buffer_frames. 4 periods of headroom keeps us out
-    // of underrun range on loaded systems.
-    let mut period: c_ulong = req
-        .buffer_frames
-        .map(|b| b as c_ulong)
-        .unwrap_or_else(|| (rate as c_ulong / 50).max(64));
-    let mut dir2: c_int = 0;
-    check(
-        &l,
-        (l.hw_params_set_period_size_near)(pcm, hw, &mut period, &mut dir2),
-        "hw_params_set_period_size_near",
-    )?;
-
-    let mut buffer: c_ulong = period.saturating_mul(4);
-    let _ = (l.hw_params_set_buffer_size_near)(pcm, hw, &mut buffer); // best-effort
-
-    check(&l, (l.hw_params)(pcm, hw), "hw_params (commit)")?;
-
-    let mut period_actual: c_ulong = 0;
-    let mut pd: c_int = 0;
-    let _ = (l.hw_params_get_period_size)(hw, &mut period_actual, &mut pd);
-    drop(hw_guard);
-
-    check(&l, (l.snd_pcm_prepare)(pcm), "snd_pcm_prepare")?;
-
-    let period_frames = period_actual.max(period) as usize;
-    let channels = want_ch as usize;
-    let frames_played = Arc::new(AtomicU64::new(0));
-    let stop = Arc::new(AtomicBool::new(false));
-    // Latest `snd_pcm_delay()` reading, in frames. Negative values are
-    // ALSA's "the PCM is ahead of us" which shouldn't happen for
-    // playback; we store i64 to match the sign of snd_pcm_sframes_t.
-    let delay_frames = Arc::new(AtomicI64::new(0));
-
-    let state = AlsaWorkerState {
-        lib: l.clone(),
-        pcm: PcmPtr(pcm),
-        cb,
-        period_frames,
-        channels,
-        device_fmt_is_f32,
-        frames_played: frames_played.clone(),
-        stop: stop.clone(),
-        delay_frames: delay_frames.clone(),
-    };
-
-    let thread = std::thread::Builder::new()
-        .name("oxideav-sysaudio-alsa".into())
-        .spawn(move || state.run())
-        .map_err(|e| Error::Runtime {
-            backend: "alsa",
-            detail: format!("spawn worker: {e}"),
-        })?;
-
-    Ok(Box::new(AlsaStream {
-        lib: l,
-        pcm: PcmPtr(pcm),
-        stop,
-        thread: Some(thread),
-        delay_frames,
-        format: StreamFormat {
-            sample_rate: rate,
-            channels: want_ch as u16,
-            format: SampleFormat::F32,
-        },
-    }))
+        Ok(Box::new(AlsaStream {
+            lib: l,
+            pcm: PcmPtr(pcm),
+            stop,
+            thread: Some(thread),
+            delay_frames,
+            format: StreamFormat {
+                sample_rate: rate,
+                channels: want_ch as u16,
+                format: SampleFormat::F32,
+            },
+        }))
+    }
 }
 
 fn check(l: &AlsaLib, r: c_int, ctx: &'static str) -> Result<()> {

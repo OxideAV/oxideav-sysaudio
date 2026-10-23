@@ -475,50 +475,54 @@ fn cf_lib() -> Option<Arc<CfLib>> {
 /// must `CFRelease` it once the AudioQueue has consumed it. Returns
 /// `None` if the property is unavailable or the size is wrong.
 unsafe fn hal_get_device_uid(ca: &CaLib, device: AudioObjectID) -> Option<CFTypeRef> {
-    let addr = AudioObjectPropertyAddress {
-        mSelector: kAudioDevicePropertyDeviceUID,
-        mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: kAudioObjectPropertyElementMain,
-    };
-    let mut value: CFTypeRef = ptr::null();
-    let mut size: u32 = std::mem::size_of::<CFTypeRef>() as u32;
-    let r = (ca.AudioObjectGetPropertyData)(
-        device,
-        &addr,
-        0,
-        ptr::null(),
-        &mut size,
-        &mut value as *mut CFTypeRef as *mut c_void,
-    );
-    if r == 0 && !value.is_null() && size as usize == std::mem::size_of::<CFTypeRef>() {
-        Some(value)
-    } else {
-        None
+    unsafe {
+        let addr = AudioObjectPropertyAddress {
+            mSelector: kAudioDevicePropertyDeviceUID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        let mut value: CFTypeRef = ptr::null();
+        let mut size: u32 = std::mem::size_of::<CFTypeRef>() as u32;
+        let r = (ca.AudioObjectGetPropertyData)(
+            device,
+            &addr,
+            0,
+            ptr::null(),
+            &mut size,
+            &mut value as *mut CFTypeRef as *mut c_void,
+        );
+        if r == 0 && !value.is_null() && size as usize == std::mem::size_of::<CFTypeRef>() {
+            Some(value)
+        } else {
+            None
+        }
     }
 }
 
 /// Query `prop` from `object` as a single `u32`. Returns `None` if the
 /// property is missing, the wrong size, or the getter fails.
 unsafe fn hal_get_u32(ca: &CaLib, object: AudioObjectID, selector: u32, scope: u32) -> Option<u32> {
-    let addr = AudioObjectPropertyAddress {
-        mSelector: selector,
-        mScope: scope,
-        mElement: kAudioObjectPropertyElementMain,
-    };
-    let mut value: u32 = 0;
-    let mut size: u32 = std::mem::size_of::<u32>() as u32;
-    let r = (ca.AudioObjectGetPropertyData)(
-        object,
-        &addr,
-        0,
-        ptr::null(),
-        &mut size,
-        &mut value as *mut u32 as *mut c_void,
-    );
-    if r == 0 && size as usize == std::mem::size_of::<u32>() {
-        Some(value)
-    } else {
-        None
+    unsafe {
+        let addr = AudioObjectPropertyAddress {
+            mSelector: selector,
+            mScope: scope,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        let mut value: u32 = 0;
+        let mut size: u32 = std::mem::size_of::<u32>() as u32;
+        let r = (ca.AudioObjectGetPropertyData)(
+            object,
+            &addr,
+            0,
+            ptr::null(),
+            &mut size,
+            &mut value as *mut u32 as *mut c_void,
+        );
+        if r == 0 && size as usize == std::mem::size_of::<u32>() {
+            Some(value)
+        } else {
+            None
+        }
     }
 }
 
@@ -528,33 +532,35 @@ unsafe fn hal_get_u32(ca: &CaLib, object: AudioObjectID, selector: u32, scope: u
 /// devices are rare for playback and all streams on the same physical
 /// device share the same HAL latency anyway.
 unsafe fn hal_first_output_stream(ca: &CaLib, device: AudioObjectID) -> Option<AudioObjectID> {
-    let addr = AudioObjectPropertyAddress {
-        mSelector: kAudioDevicePropertyStreams,
-        mScope: kAudioObjectPropertyScopeOutput,
-        mElement: kAudioObjectPropertyElementMain,
-    };
-    // Two-step idiom: `AudioObjectGetPropertyDataSize` to learn the
-    // byte size, then allocate and query the data. The HAL insists on
-    // this even when we only want one element.
-    let mut size: u32 = 0;
-    let r = (ca.AudioObjectGetPropertyDataSize)(device, &addr, 0, ptr::null(), &mut size);
-    if r != 0 || size < std::mem::size_of::<AudioObjectID>() as u32 {
-        return None;
+    unsafe {
+        let addr = AudioObjectPropertyAddress {
+            mSelector: kAudioDevicePropertyStreams,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        // Two-step idiom: `AudioObjectGetPropertyDataSize` to learn the
+        // byte size, then allocate and query the data. The HAL insists on
+        // this even when we only want one element.
+        let mut size: u32 = 0;
+        let r = (ca.AudioObjectGetPropertyDataSize)(device, &addr, 0, ptr::null(), &mut size);
+        if r != 0 || size < std::mem::size_of::<AudioObjectID>() as u32 {
+            return None;
+        }
+        let count = size as usize / std::mem::size_of::<AudioObjectID>();
+        let mut buf: Vec<AudioObjectID> = vec![0; count];
+        let r = (ca.AudioObjectGetPropertyData)(
+            device,
+            &addr,
+            0,
+            ptr::null(),
+            &mut size,
+            buf.as_mut_ptr() as *mut c_void,
+        );
+        if r != 0 {
+            return None;
+        }
+        buf.into_iter().next().filter(|id| *id != 0)
     }
-    let count = size as usize / std::mem::size_of::<AudioObjectID>();
-    let mut buf: Vec<AudioObjectID> = vec![0; count];
-    let r = (ca.AudioObjectGetPropertyData)(
-        device,
-        &addr,
-        0,
-        ptr::null(),
-        &mut size,
-        buf.as_mut_ptr() as *mut c_void,
-    );
-    if r != 0 {
-        return None;
-    }
-    buf.into_iter().next().filter(|id| *id != 0)
 }
 
 /// Total hardware-side latency (in frames) for an output device. Sums
@@ -574,132 +580,136 @@ unsafe fn query_hardware_latency_frames(
     ca: &CaLib,
     bound_device: Option<AudioObjectID>,
 ) -> Option<u32> {
-    let device = match bound_device {
-        Some(d) if d != 0 => d,
-        _ => {
-            let default_addr = AudioObjectPropertyAddress {
-                mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain,
-            };
-            let mut device: AudioObjectID = 0;
-            let mut size: u32 = std::mem::size_of::<AudioObjectID>() as u32;
-            let r = (ca.AudioObjectGetPropertyData)(
-                kAudioObjectSystemObject,
-                &default_addr,
-                0,
-                ptr::null(),
-                &mut size,
-                &mut device as *mut AudioObjectID as *mut c_void,
-            );
-            if r != 0 || device == 0 {
-                return None;
+    unsafe {
+        let device = match bound_device {
+            Some(d) if d != 0 => d,
+            _ => {
+                let default_addr = AudioObjectPropertyAddress {
+                    mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                    mScope: kAudioObjectPropertyScopeGlobal,
+                    mElement: kAudioObjectPropertyElementMain,
+                };
+                let mut device: AudioObjectID = 0;
+                let mut size: u32 = std::mem::size_of::<AudioObjectID>() as u32;
+                let r = (ca.AudioObjectGetPropertyData)(
+                    kAudioObjectSystemObject,
+                    &default_addr,
+                    0,
+                    ptr::null(),
+                    &mut size,
+                    &mut device as *mut AudioObjectID as *mut c_void,
+                );
+                if r != 0 || device == 0 {
+                    return None;
+                }
+                device
             }
-            device
-        }
-    };
+        };
 
-    // Device-side fixed latency + live buffer size + safety offset on
-    // the OUTPUT scope. Any of these may be unreported on exotic
-    // hardware; treat a missing property as 0 rather than bailing out
-    // so BT headphones (which report their 100ms-ish latency through
-    // `kAudioDevicePropertyLatency`) still get counted even if e.g.
-    // their buffer-frame-size query fails.
-    let dev_latency = hal_get_u32(
-        ca,
-        device,
-        kAudioDevicePropertyLatency,
-        kAudioObjectPropertyScopeOutput,
-    )
-    .or_else(|| {
-        hal_get_u32(
+        // Device-side fixed latency + live buffer size + safety offset on
+        // the OUTPUT scope. Any of these may be unreported on exotic
+        // hardware; treat a missing property as 0 rather than bailing out
+        // so BT headphones (which report their 100ms-ish latency through
+        // `kAudioDevicePropertyLatency`) still get counted even if e.g.
+        // their buffer-frame-size query fails.
+        let dev_latency = hal_get_u32(
             ca,
             device,
             kAudioDevicePropertyLatency,
-            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyScopeOutput,
         )
-    })
-    .unwrap_or(0);
-    let buffer_frames = hal_get_u32(
-        ca,
-        device,
-        kAudioDevicePropertyBufferFrameSize,
-        kAudioObjectPropertyScopeOutput,
-    )
-    .or_else(|| {
-        hal_get_u32(
-            ca,
-            device,
-            kAudioDevicePropertyBufferFrameSize,
-            kAudioObjectPropertyScopeGlobal,
-        )
-    })
-    .unwrap_or(0);
-    let safety_offset = hal_get_u32(
-        ca,
-        device,
-        kAudioDevicePropertySafetyOffset,
-        kAudioObjectPropertyScopeOutput,
-    )
-    .unwrap_or(0);
-
-    // Per-stream latency on the device's first output stream. Optional
-    // — not all HAL drivers populate it, and it's typically 0-few
-    // frames (format-conversion buffers) on top of the device figure.
-    let stream_latency = hal_first_output_stream(ca, device)
-        .and_then(|stream| {
+        .or_else(|| {
             hal_get_u32(
                 ca,
-                stream,
-                kAudioStreamPropertyLatency,
+                device,
+                kAudioDevicePropertyLatency,
                 kAudioObjectPropertyScopeGlobal,
             )
         })
         .unwrap_or(0);
+        let buffer_frames = hal_get_u32(
+            ca,
+            device,
+            kAudioDevicePropertyBufferFrameSize,
+            kAudioObjectPropertyScopeOutput,
+        )
+        .or_else(|| {
+            hal_get_u32(
+                ca,
+                device,
+                kAudioDevicePropertyBufferFrameSize,
+                kAudioObjectPropertyScopeGlobal,
+            )
+        })
+        .unwrap_or(0);
+        let safety_offset = hal_get_u32(
+            ca,
+            device,
+            kAudioDevicePropertySafetyOffset,
+            kAudioObjectPropertyScopeOutput,
+        )
+        .unwrap_or(0);
 
-    Some(
-        dev_latency
-            .saturating_add(buffer_frames)
-            .saturating_add(safety_offset)
-            .saturating_add(stream_latency),
-    )
+        // Per-stream latency on the device's first output stream. Optional
+        // — not all HAL drivers populate it, and it's typically 0-few
+        // frames (format-conversion buffers) on top of the device figure.
+        let stream_latency = hal_first_output_stream(ca, device)
+            .and_then(|stream| {
+                hal_get_u32(
+                    ca,
+                    stream,
+                    kAudioStreamPropertyLatency,
+                    kAudioObjectPropertyScopeGlobal,
+                )
+            })
+            .unwrap_or(0);
+
+        Some(
+            dev_latency
+                .saturating_add(buffer_frames)
+                .saturating_add(safety_offset)
+                .saturating_add(stream_latency),
+        )
+    }
 }
 
 /// All device IDs the HAL knows about (`kAudioHardwarePropertyDevices`
 /// on the system object). Same two-step size-then-data idiom as
 /// `hal_first_output_stream`.
 unsafe fn hal_all_devices(ca: &CaLib) -> Vec<AudioObjectID> {
-    let addr = AudioObjectPropertyAddress {
-        mSelector: kAudioHardwarePropertyDevices,
-        mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: kAudioObjectPropertyElementMain,
-    };
-    let mut size: u32 = 0;
-    let r = (ca.AudioObjectGetPropertyDataSize)(
-        kAudioObjectSystemObject,
-        &addr,
-        0,
-        ptr::null(),
-        &mut size,
-    );
-    if r != 0 || size < std::mem::size_of::<AudioObjectID>() as u32 {
-        return Vec::new();
+    unsafe {
+        let addr = AudioObjectPropertyAddress {
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        let mut size: u32 = 0;
+        let r = (ca.AudioObjectGetPropertyDataSize)(
+            kAudioObjectSystemObject,
+            &addr,
+            0,
+            ptr::null(),
+            &mut size,
+        );
+        if r != 0 || size < std::mem::size_of::<AudioObjectID>() as u32 {
+            return Vec::new();
+        }
+        let count = size as usize / std::mem::size_of::<AudioObjectID>();
+        let mut buf: Vec<AudioObjectID> = vec![0; count];
+        let r = (ca.AudioObjectGetPropertyData)(
+            kAudioObjectSystemObject,
+            &addr,
+            0,
+            ptr::null(),
+            &mut size,
+            buf.as_mut_ptr() as *mut c_void,
+        );
+        if r != 0 {
+            return Vec::new();
+        }
+        buf.retain(|&id| id != 0);
+        buf
     }
-    let count = size as usize / std::mem::size_of::<AudioObjectID>();
-    let mut buf: Vec<AudioObjectID> = vec![0; count];
-    let r = (ca.AudioObjectGetPropertyData)(
-        kAudioObjectSystemObject,
-        &addr,
-        0,
-        ptr::null(),
-        &mut size,
-        buf.as_mut_ptr() as *mut c_void,
-    );
-    if r != 0 {
-        return Vec::new();
-    }
-    buf.retain(|&id| id != 0);
-    buf
 }
 
 /// `true` when `device` has at least one stream on the output scope —
@@ -707,14 +717,16 @@ unsafe fn hal_all_devices(ca: &CaLib) -> Vec<AudioObjectID> {
 /// capture) report zero output streams and are dropped from the
 /// playback list.
 unsafe fn hal_is_output_device(ca: &CaLib, device: AudioObjectID) -> bool {
-    let addr = AudioObjectPropertyAddress {
-        mSelector: kAudioDevicePropertyStreams,
-        mScope: kAudioObjectPropertyScopeOutput,
-        mElement: kAudioObjectPropertyElementMain,
-    };
-    let mut size: u32 = 0;
-    let r = (ca.AudioObjectGetPropertyDataSize)(device, &addr, 0, ptr::null(), &mut size);
-    r == 0 && size >= std::mem::size_of::<AudioObjectID>() as u32
+    unsafe {
+        let addr = AudioObjectPropertyAddress {
+            mSelector: kAudioDevicePropertyStreams,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        let mut size: u32 = 0;
+        let r = (ca.AudioObjectGetPropertyDataSize)(device, &addr, 0, ptr::null(), &mut size);
+        r == 0 && size >= std::mem::size_of::<AudioObjectID>() as u32
+    }
 }
 
 /// Friendly name for `device` via the deprecated-but-CFString-free
@@ -722,34 +734,36 @@ unsafe fn hal_is_output_device(ca: &CaLib, device: AudioObjectID) -> bool {
 /// string into a caller buffer. Returns an empty string if the HAL
 /// reports no name.
 unsafe fn hal_device_name(ca: &CaLib, device: AudioObjectID) -> String {
-    let addr = AudioObjectPropertyAddress {
-        mSelector: kAudioDevicePropertyDeviceName,
-        mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: kAudioObjectPropertyElementMain,
-    };
-    let mut size: u32 = 0;
-    let r = (ca.AudioObjectGetPropertyDataSize)(device, &addr, 0, ptr::null(), &mut size);
-    if r != 0 || size == 0 {
-        return String::new();
+    unsafe {
+        let addr = AudioObjectPropertyAddress {
+            mSelector: kAudioDevicePropertyDeviceName,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        let mut size: u32 = 0;
+        let r = (ca.AudioObjectGetPropertyDataSize)(device, &addr, 0, ptr::null(), &mut size);
+        if r != 0 || size == 0 {
+            return String::new();
+        }
+        // Cap the buffer defensively — a sane device name is well under 1 KiB.
+        let cap = (size as usize).min(4096);
+        let mut buf: Vec<u8> = vec![0u8; cap];
+        let mut got = cap as u32;
+        let r = (ca.AudioObjectGetPropertyData)(
+            device,
+            &addr,
+            0,
+            ptr::null(),
+            &mut got,
+            buf.as_mut_ptr() as *mut c_void,
+        );
+        if r != 0 {
+            return String::new();
+        }
+        // The buffer is a C string; trim at the first NUL.
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..end]).into_owned()
     }
-    // Cap the buffer defensively — a sane device name is well under 1 KiB.
-    let cap = (size as usize).min(4096);
-    let mut buf: Vec<u8> = vec![0u8; cap];
-    let mut got = cap as u32;
-    let r = (ca.AudioObjectGetPropertyData)(
-        device,
-        &addr,
-        0,
-        ptr::null(),
-        &mut got,
-        buf.as_mut_ptr() as *mut c_void,
-    );
-    if r != 0 {
-        return String::new();
-    }
-    // The buffer is a C string; trim at the first NUL.
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    String::from_utf8_lossy(&buf[..end]).into_owned()
 }
 
 /// Query `selector` from `object` as a single `f64`. Returns `None` if the
@@ -757,25 +771,27 @@ unsafe fn hal_device_name(ca: &CaLib, device: AudioObjectID) -> String {
 /// `kAudioDevicePropertyNominalSampleRate`, whose value is a HAL-typed
 /// `Float64`.
 unsafe fn hal_get_f64(ca: &CaLib, object: AudioObjectID, selector: u32, scope: u32) -> Option<f64> {
-    let addr = AudioObjectPropertyAddress {
-        mSelector: selector,
-        mScope: scope,
-        mElement: kAudioObjectPropertyElementMain,
-    };
-    let mut value: f64 = 0.0;
-    let mut size: u32 = std::mem::size_of::<f64>() as u32;
-    let r = (ca.AudioObjectGetPropertyData)(
-        object,
-        &addr,
-        0,
-        ptr::null(),
-        &mut size,
-        &mut value as *mut f64 as *mut c_void,
-    );
-    if r == 0 && size as usize == std::mem::size_of::<f64>() {
-        Some(value)
-    } else {
-        None
+    unsafe {
+        let addr = AudioObjectPropertyAddress {
+            mSelector: selector,
+            mScope: scope,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        let mut value: f64 = 0.0;
+        let mut size: u32 = std::mem::size_of::<f64>() as u32;
+        let r = (ca.AudioObjectGetPropertyData)(
+            object,
+            &addr,
+            0,
+            ptr::null(),
+            &mut size,
+            &mut value as *mut f64 as *mut c_void,
+        );
+        if r == 0 && size as usize == std::mem::size_of::<f64>() {
+            Some(value)
+        } else {
+            None
+        }
     }
 }
 
@@ -785,50 +801,50 @@ unsafe fn hal_get_f64(ca: &CaLib, object: AudioObjectID, selector: u32, scope: u
 /// own rate / channel conversion. Returns `None` if the property is
 /// missing, the wrong size, or the getter fails.
 unsafe fn hal_get_asbd(ca: &CaLib, stream: AudioObjectID) -> Option<AudioStreamBasicDescription> {
-    let addr = AudioObjectPropertyAddress {
-        mSelector: kAudioStreamPropertyVirtualFormat,
-        mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: kAudioObjectPropertyElementMain,
-    };
-    let mut value = AudioStreamBasicDescription::default();
-    let mut size: u32 = std::mem::size_of::<AudioStreamBasicDescription>() as u32;
-    let r = (ca.AudioObjectGetPropertyData)(
-        stream,
-        &addr,
-        0,
-        ptr::null(),
-        &mut size,
-        &mut value as *mut AudioStreamBasicDescription as *mut c_void,
-    );
-    if r == 0 && size as usize == std::mem::size_of::<AudioStreamBasicDescription>() {
-        Some(value)
-    } else {
-        None
+    unsafe {
+        let addr = AudioObjectPropertyAddress {
+            mSelector: kAudioStreamPropertyVirtualFormat,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        let mut value = AudioStreamBasicDescription::default();
+        let mut size: u32 = std::mem::size_of::<AudioStreamBasicDescription>() as u32;
+        let r = (ca.AudioObjectGetPropertyData)(
+            stream,
+            &addr,
+            0,
+            ptr::null(),
+            &mut size,
+            &mut value as *mut AudioStreamBasicDescription as *mut c_void,
+        );
+        if r == 0 && size as usize == std::mem::size_of::<AudioStreamBasicDescription>() {
+            Some(value)
+        } else {
+            None
+        }
     }
 }
 
 /// Numeric AudioDeviceID of the current default output, or 0 if the
 /// query fails.
 unsafe fn hal_default_output_device(ca: &CaLib) -> AudioObjectID {
-    let addr = AudioObjectPropertyAddress {
-        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-        mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: kAudioObjectPropertyElementMain,
-    };
-    let mut device: AudioObjectID = 0;
-    let mut size: u32 = std::mem::size_of::<AudioObjectID>() as u32;
-    let r = (ca.AudioObjectGetPropertyData)(
-        kAudioObjectSystemObject,
-        &addr,
-        0,
-        ptr::null(),
-        &mut size,
-        &mut device as *mut AudioObjectID as *mut c_void,
-    );
-    if r != 0 {
-        0
-    } else {
-        device
+    unsafe {
+        let addr = AudioObjectPropertyAddress {
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        let mut device: AudioObjectID = 0;
+        let mut size: u32 = std::mem::size_of::<AudioObjectID>() as u32;
+        let r = (ca.AudioObjectGetPropertyData)(
+            kAudioObjectSystemObject,
+            &addr,
+            0,
+            ptr::null(),
+            &mut size,
+            &mut device as *mut AudioObjectID as *mut c_void,
+        );
+        if r != 0 { 0 } else { device }
     }
 }
 
@@ -1036,39 +1052,41 @@ unsafe extern "C" fn output_trampoline(
     _q: AudioQueueRef,
     buffer: AudioQueueBufferRef,
 ) {
-    if user.is_null() || buffer.is_null() {
-        return;
-    }
-    let state = &*(user as *const CallbackState);
-    let buf = &mut *buffer;
-    let capacity = buf.mAudioDataBytesCapacity as usize;
-    let frames = capacity / (4 * state.channels);
-    let samples = frames * state.channels;
-    let slice = std::slice::from_raw_parts_mut(buf.mAudioData as *mut f32, samples);
-
-    if state.paused.load(Ordering::Relaxed) {
-        for s in slice.iter_mut() {
-            *s = 0.0;
+    unsafe {
+        if user.is_null() || buffer.is_null() {
+            return;
         }
-    } else {
-        let info = CallbackInfo {
-            frames_played: state.frames_played.load(Ordering::Relaxed),
-        };
-        let mut g = state.cb.lock().unwrap();
-        (g)(slice, &info);
-    }
+        let state = &*(user as *const CallbackState);
+        let buf = &mut *buffer;
+        let capacity = buf.mAudioDataBytesCapacity as usize;
+        let frames = capacity / (4 * state.channels);
+        let samples = frames * state.channels;
+        let slice = std::slice::from_raw_parts_mut(buf.mAudioData as *mut f32, samples);
 
-    buf.mAudioDataByteSize = (samples * 4) as u32;
-    if !state.paused.load(Ordering::Relaxed) {
-        state
-            .frames_played
-            .fetch_add(frames as u64, Ordering::Relaxed);
-    }
+        if state.paused.load(Ordering::Relaxed) {
+            for s in slice.iter_mut() {
+                *s = 0.0;
+            }
+        } else {
+            let info = CallbackInfo {
+                frames_played: state.frames_played.load(Ordering::Relaxed),
+            };
+            let mut g = state.cb.lock().unwrap();
+            (g)(slice, &info);
+        }
 
-    // Re-enqueue — without this, CA stops calling us after three
-    // buffers (the ones we pre-allocated).
-    if let Some(l) = LIB_FOR_CALLBACK.get() {
-        let _ = (l.AudioQueueEnqueueBuffer)(_q, buffer, 0, ptr::null());
+        buf.mAudioDataByteSize = (samples * 4) as u32;
+        if !state.paused.load(Ordering::Relaxed) {
+            state
+                .frames_played
+                .fetch_add(frames as u64, Ordering::Relaxed);
+        }
+
+        // Re-enqueue — without this, CA stops calling us after three
+        // buffers (the ones we pre-allocated).
+        if let Some(l) = LIB_FOR_CALLBACK.get() {
+            let _ = (l.AudioQueueEnqueueBuffer)(_q, buffer, 0, ptr::null());
+        }
     }
 }
 
@@ -1088,200 +1106,209 @@ unsafe fn open_inner(
     req: StreamRequest,
     cb: Callback,
 ) -> Result<Box<dyn StreamImpl>> {
-    // Per-device routing on AudioQueue takes a CFStringRef device UID
-    // (`kAudioQueueProperty_CurrentDevice`), whereas the opaque `Device::id`
-    // we expose is the numeric `AudioDeviceID`. The HAL bridges between the
-    // two: query `kAudioDevicePropertyDeviceUID` on the numeric id, hand the
-    // resulting CFStringRef straight to `AudioQueueSetProperty`, then
-    // `CFRelease` it once the queue has copied the value. CoreFoundation is
-    // dlopen'd through `cf_lib()` so the no-link-time-deps invariant holds.
-    //
-    // If the caller asked for a device but the platform fails any required
-    // step (CF can't load, the id isn't a decimal AudioDeviceID, the device
-    // has no UID, or the AudioQueue refuses the property), surface a clean
-    // `UnsupportedFormat` rather than silently routing to the system default —
-    // that would defeat the entire purpose of `open_on` / `with_device`.
-    let routing: Option<(AudioObjectID, Arc<CfLib>, Arc<CaLib>)> = match req.device.as_deref() {
-        None => None,
-        Some(id_str) => {
-            let device_id: AudioObjectID =
-                id_str.parse().map_err(|_| Error::UnsupportedFormat {
-                    backend: "coreaudio",
-                    detail: format!(
-                        "device id {id_str:?} is not a numeric AudioDeviceID (must come from \
+    unsafe {
+        // Per-device routing on AudioQueue takes a CFStringRef device UID
+        // (`kAudioQueueProperty_CurrentDevice`), whereas the opaque `Device::id`
+        // we expose is the numeric `AudioDeviceID`. The HAL bridges between the
+        // two: query `kAudioDevicePropertyDeviceUID` on the numeric id, hand the
+        // resulting CFStringRef straight to `AudioQueueSetProperty`, then
+        // `CFRelease` it once the queue has copied the value. CoreFoundation is
+        // dlopen'd through `cf_lib()` so the no-link-time-deps invariant holds.
+        //
+        // If the caller asked for a device but the platform fails any required
+        // step (CF can't load, the id isn't a decimal AudioDeviceID, the device
+        // has no UID, or the AudioQueue refuses the property), surface a clean
+        // `UnsupportedFormat` rather than silently routing to the system default —
+        // that would defeat the entire purpose of `open_on` / `with_device`.
+        let routing: Option<(AudioObjectID, Arc<CfLib>, Arc<CaLib>)> = match req.device.as_deref() {
+            None => None,
+            Some(id_str) => {
+                let device_id: AudioObjectID =
+                    id_str.parse().map_err(|_| Error::UnsupportedFormat {
+                        backend: "coreaudio",
+                        detail: format!(
+                            "device id {id_str:?} is not a numeric AudioDeviceID (must come from \
                          output_devices() on the same coreaudio backend)"
-                    ),
+                        ),
+                    })?;
+                let ca = ca_lib().ok_or(Error::UnsupportedFormat {
+                    backend: "coreaudio",
+                    detail:
+                        "CoreAudio.framework HAL is required for per-device routing but failed \
+                         to load"
+                            .into(),
                 })?;
-            let ca = ca_lib().ok_or(Error::UnsupportedFormat {
-                backend: "coreaudio",
-                detail: "CoreAudio.framework HAL is required for per-device routing but failed \
+                let cf = cf_lib().ok_or(Error::UnsupportedFormat {
+                    backend: "coreaudio",
+                    detail:
+                        "CoreFoundation.framework is required for per-device routing but failed \
                          to load"
-                    .into(),
-            })?;
-            let cf = cf_lib().ok_or(Error::UnsupportedFormat {
-                backend: "coreaudio",
-                detail: "CoreFoundation.framework is required for per-device routing but failed \
-                         to load"
-                    .into(),
-            })?;
-            Some((device_id, cf, ca))
-        }
-    };
+                            .into(),
+                })?;
+                Some((device_id, cf, ca))
+            }
+        };
 
-    let _ = LIB_FOR_CALLBACK.set(l.clone()); // no-op on subsequent opens
+        let _ = LIB_FOR_CALLBACK.set(l.clone()); // no-op on subsequent opens
 
-    let channels = req.channels.clamp(1, 8);
-    let asbd = f32_asbd(req.sample_rate as f64, channels);
+        let channels = req.channels.clamp(1, 8);
+        let asbd = f32_asbd(req.sample_rate as f64, channels);
 
-    let paused = Arc::new(AtomicBool::new(false));
-    let frames_played = Arc::new(AtomicU64::new(0));
+        let paused = Arc::new(AtomicBool::new(false));
+        let frames_played = Arc::new(AtomicU64::new(0));
 
-    let state = Box::new(CallbackState {
-        cb: Mutex::new(cb),
-        channels: channels as usize,
-        paused: paused.clone(),
-        frames_played: frames_played.clone(),
-    });
-    let state_ptr = Box::into_raw(state);
-
-    let mut queue: AudioQueueRef = ptr::null_mut();
-    let r = (l.AudioQueueNewOutput)(
-        &asbd,
-        output_trampoline,
-        state_ptr as *mut c_void,
-        ptr::null_mut(),
-        ptr::null(),
-        0,
-        &mut queue,
-    );
-    if r != 0 || queue.is_null() {
-        drop(Box::from_raw(state_ptr));
-        return Err(Error::DeviceOpen {
-            backend: "coreaudio",
-            detail: format!("AudioQueueNewOutput OSStatus={r}"),
+        let state = Box::new(CallbackState {
+            cb: Mutex::new(cb),
+            channels: channels as usize,
+            paused: paused.clone(),
+            frames_played: frames_played.clone(),
         });
-    }
+        let state_ptr = Box::into_raw(state);
 
-    // Per-device routing: now that the queue exists, bind it to the
-    // caller-requested endpoint before any buffer is enqueued or
-    // `AudioQueueStart` runs. Per `AudioQueue.h` the property must be set
-    // before the queue is started; setting it on a running queue is
-    // ill-defined and typically returns `kAudioQueueErr_CannotStart`.
-    if let Some((device_id, cf, ca)) = routing.as_ref() {
-        let uid = match hal_get_device_uid(ca, *device_id) {
-            Some(u) => u,
-            None => {
+        let mut queue: AudioQueueRef = ptr::null_mut();
+        let r = (l.AudioQueueNewOutput)(
+            &asbd,
+            output_trampoline,
+            state_ptr as *mut c_void,
+            ptr::null_mut(),
+            ptr::null(),
+            0,
+            &mut queue,
+        );
+        if r != 0 || queue.is_null() {
+            drop(Box::from_raw(state_ptr));
+            return Err(Error::DeviceOpen {
+                backend: "coreaudio",
+                detail: format!("AudioQueueNewOutput OSStatus={r}"),
+            });
+        }
+
+        // Per-device routing: now that the queue exists, bind it to the
+        // caller-requested endpoint before any buffer is enqueued or
+        // `AudioQueueStart` runs. Per `AudioQueue.h` the property must be set
+        // before the queue is started; setting it on a running queue is
+        // ill-defined and typically returns `kAudioQueueErr_CannotStart`.
+        if let Some((device_id, cf, ca)) = routing.as_ref() {
+            let uid = match hal_get_device_uid(ca, *device_id) {
+                Some(u) => u,
+                None => {
+                    (l.AudioQueueDispose)(queue, 1);
+                    drop(Box::from_raw(state_ptr));
+                    return Err(Error::UnsupportedFormat {
+                        backend: "coreaudio",
+                        detail: format!(
+                            "AudioDeviceID {device_id} has no DeviceUID property — not an \
+                         output device or HAL refused the query"
+                        ),
+                    });
+                }
+            };
+            // AudioQueueSetProperty takes a pointer-to-CFStringRef (the property
+            // value is CFStringRef, so the inData pointer is `&CFStringRef` and
+            // inDataSize is `sizeof(CFStringRef)`).
+            let r = (l.AudioQueueSetProperty)(
+                queue,
+                kAudioQueueProperty_CurrentDevice,
+                &uid as *const CFTypeRef as *const c_void,
+                std::mem::size_of::<CFTypeRef>() as u32,
+            );
+            // The queue retained the CFString internally (or refused, in which
+            // case there's nothing to undo on the queue side). Either way the
+            // HAL handed us a +1 ref to drop — Apple's get/copy rule: the
+            // `kAudioDevicePropertyDeviceUID` docs say "the caller is
+            // responsible for releasing the returned CFObject".
+            (cf.CFRelease)(uid);
+            if r != 0 {
                 (l.AudioQueueDispose)(queue, 1);
                 drop(Box::from_raw(state_ptr));
-                return Err(Error::UnsupportedFormat {
+                return Err(Error::DeviceOpen {
                     backend: "coreaudio",
                     detail: format!(
-                        "AudioDeviceID {device_id} has no DeviceUID property — not an \
-                         output device or HAL refused the query"
+                        "AudioQueueSetProperty(CurrentDevice={device_id}) OSStatus={r}"
                     ),
                 });
             }
-        };
-        // AudioQueueSetProperty takes a pointer-to-CFStringRef (the property
-        // value is CFStringRef, so the inData pointer is `&CFStringRef` and
-        // inDataSize is `sizeof(CFStringRef)`).
-        let r = (l.AudioQueueSetProperty)(
-            queue,
-            kAudioQueueProperty_CurrentDevice,
-            &uid as *const CFTypeRef as *const c_void,
-            std::mem::size_of::<CFTypeRef>() as u32,
-        );
-        // The queue retained the CFString internally (or refused, in which
-        // case there's nothing to undo on the queue side). Either way the
-        // HAL handed us a +1 ref to drop — Apple's get/copy rule: the
-        // `kAudioDevicePropertyDeviceUID` docs say "the caller is
-        // responsible for releasing the returned CFObject".
-        (cf.CFRelease)(uid);
+        }
+
+        // `NUM_BUFFERS` buffers × ~20 ms each. The CA thread round-robins
+        // through them as the user's callback refills them.
+        let frames_per_buf = req
+            .buffer_frames
+            .map(|n| n as usize)
+            .unwrap_or_else(|| (req.sample_rate as usize / 50).max(64));
+        let bytes_per_buf = (frames_per_buf * channels as usize * 4) as u32;
+
+        let mut buffers: [AudioQueueBufferRef; NUM_BUFFERS] = [ptr::null_mut(); NUM_BUFFERS];
+        for slot in &mut buffers {
+            let r = (l.AudioQueueAllocateBuffer)(
+                queue,
+                bytes_per_buf,
+                slot as *mut AudioQueueBufferRef,
+            );
+            if r != 0 || slot.is_null() {
+                (l.AudioQueueDispose)(queue, 1);
+                drop(Box::from_raw(state_ptr));
+                return Err(Error::DeviceOpen {
+                    backend: "coreaudio",
+                    detail: format!("AudioQueueAllocateBuffer OSStatus={r}"),
+                });
+            }
+            // Prime with silence and the full capacity so CA doesn't think
+            // the buffer is under-filled.
+            let buf = &mut **slot;
+            buf.mAudioDataByteSize = bytes_per_buf;
+            ptr::write_bytes(buf.mAudioData as *mut u8, 0, bytes_per_buf as usize);
+            (l.AudioQueueEnqueueBuffer)(queue, *slot, 0, ptr::null());
+        }
+
+        let r = (l.AudioQueueStart)(queue, ptr::null());
         if r != 0 {
             (l.AudioQueueDispose)(queue, 1);
             drop(Box::from_raw(state_ptr));
             return Err(Error::DeviceOpen {
                 backend: "coreaudio",
-                detail: format!("AudioQueueSetProperty(CurrentDevice={device_id}) OSStatus={r}"),
+                detail: format!("AudioQueueStart OSStatus={r}"),
             });
         }
+
+        // Software-side floor: three queued buffers × per-buffer duration.
+        // This is a hard lower bound on how long it takes a sample the
+        // caller hands us to reach the device. The hardware-side component
+        // (BT radio delay, USB-DAC pipeline depth, HDMI routing, HAL
+        // safety offset) comes from `query_hardware_latency_frames` at
+        // `latency()` time — done live because the bound device, and thus
+        // the hardware delay, can change after `open()` (default-output
+        // switch, hot-plug).
+        let sw_latency_ns = ((NUM_BUFFERS * frames_per_buf) as u64).saturating_mul(1_000_000_000)
+            / (req.sample_rate.max(1) as u64);
+
+        // Attempt to load CoreAudio.framework for HAL latency queries.
+        // Graceful degradation: if it fails (shouldn't on any modern
+        // macOS), `latency()` simply returns the software floor.
+        let ca = ca_lib();
+
+        // If we routed the queue at a specific device, lock latency queries
+        // onto that device; otherwise the queue follows the system default
+        // and `query_hardware_latency_frames` resolves the default at call
+        // time (the historical behaviour).
+        let bound_device = routing.as_ref().map(|(id, _, _)| *id);
+
+        Ok(Box::new(CoreAudioStream {
+            lib: l,
+            ca,
+            queue: QueuePtr(queue),
+            state_ptr,
+            paused,
+            sw_latency_ns,
+            bound_device,
+            format: StreamFormat {
+                sample_rate: req.sample_rate,
+                channels,
+                format: SampleFormat::F32,
+            },
+            stopped: false,
+        }))
     }
-
-    // `NUM_BUFFERS` buffers × ~20 ms each. The CA thread round-robins
-    // through them as the user's callback refills them.
-    let frames_per_buf = req
-        .buffer_frames
-        .map(|n| n as usize)
-        .unwrap_or_else(|| (req.sample_rate as usize / 50).max(64));
-    let bytes_per_buf = (frames_per_buf * channels as usize * 4) as u32;
-
-    let mut buffers: [AudioQueueBufferRef; NUM_BUFFERS] = [ptr::null_mut(); NUM_BUFFERS];
-    for slot in &mut buffers {
-        let r =
-            (l.AudioQueueAllocateBuffer)(queue, bytes_per_buf, slot as *mut AudioQueueBufferRef);
-        if r != 0 || slot.is_null() {
-            (l.AudioQueueDispose)(queue, 1);
-            drop(Box::from_raw(state_ptr));
-            return Err(Error::DeviceOpen {
-                backend: "coreaudio",
-                detail: format!("AudioQueueAllocateBuffer OSStatus={r}"),
-            });
-        }
-        // Prime with silence and the full capacity so CA doesn't think
-        // the buffer is under-filled.
-        let buf = &mut **slot;
-        buf.mAudioDataByteSize = bytes_per_buf;
-        ptr::write_bytes(buf.mAudioData as *mut u8, 0, bytes_per_buf as usize);
-        (l.AudioQueueEnqueueBuffer)(queue, *slot, 0, ptr::null());
-    }
-
-    let r = (l.AudioQueueStart)(queue, ptr::null());
-    if r != 0 {
-        (l.AudioQueueDispose)(queue, 1);
-        drop(Box::from_raw(state_ptr));
-        return Err(Error::DeviceOpen {
-            backend: "coreaudio",
-            detail: format!("AudioQueueStart OSStatus={r}"),
-        });
-    }
-
-    // Software-side floor: three queued buffers × per-buffer duration.
-    // This is a hard lower bound on how long it takes a sample the
-    // caller hands us to reach the device. The hardware-side component
-    // (BT radio delay, USB-DAC pipeline depth, HDMI routing, HAL
-    // safety offset) comes from `query_hardware_latency_frames` at
-    // `latency()` time — done live because the bound device, and thus
-    // the hardware delay, can change after `open()` (default-output
-    // switch, hot-plug).
-    let sw_latency_ns = ((NUM_BUFFERS * frames_per_buf) as u64).saturating_mul(1_000_000_000)
-        / (req.sample_rate.max(1) as u64);
-
-    // Attempt to load CoreAudio.framework for HAL latency queries.
-    // Graceful degradation: if it fails (shouldn't on any modern
-    // macOS), `latency()` simply returns the software floor.
-    let ca = ca_lib();
-
-    // If we routed the queue at a specific device, lock latency queries
-    // onto that device; otherwise the queue follows the system default
-    // and `query_hardware_latency_frames` resolves the default at call
-    // time (the historical behaviour).
-    let bound_device = routing.as_ref().map(|(id, _, _)| *id);
-
-    Ok(Box::new(CoreAudioStream {
-        lib: l,
-        ca,
-        queue: QueuePtr(queue),
-        state_ptr,
-        paused,
-        sw_latency_ns,
-        bound_device,
-        format: StreamFormat {
-            sample_rate: req.sample_rate,
-            channels,
-            format: SampleFormat::F32,
-        },
-        stopped: false,
-    }))
 }
 
 #[derive(Copy, Clone)]

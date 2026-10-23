@@ -14,8 +14,8 @@
 //! a known-good output device; CI boxes occasionally expose a device
 //! that opens but never renders, which must not turn the matrix red.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 fn wait_until(deadline: Duration, mut cond: impl FnMut() -> bool) -> bool {
