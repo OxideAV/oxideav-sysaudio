@@ -15,8 +15,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use libloading::{Library, Symbol};
+use dlsym::{Bindings, Library};
 
+use super::bind_error;
 use crate::backend::{Backend, Callback};
 use crate::format::{CallbackInfo, SampleFormat, StreamFormat, StreamRequest};
 use crate::stream::StreamImpl;
@@ -62,85 +63,69 @@ struct pa_buffer_attr {
     fragsize: u32,
 }
 
-type Fn_pa_simple_new = unsafe extern "C" fn(
-    server: *const c_char,
-    name: *const c_char,
-    dir: c_int,
-    dev: *const c_char,
-    stream_name: *const c_char,
-    ss: *const pa_sample_spec,
-    map: *const c_void,
-    attr: *const pa_buffer_attr,
-    error: *mut c_int,
-) -> *mut pa_simple;
-
-type Fn_pa_simple_free = unsafe extern "C" fn(s: *mut pa_simple);
-type Fn_pa_simple_write = unsafe extern "C" fn(
-    s: *mut pa_simple,
-    data: *const c_void,
-    bytes: usize,
-    error: *mut c_int,
-) -> c_int;
-type Fn_pa_simple_drain = unsafe extern "C" fn(s: *mut pa_simple, error: *mut c_int) -> c_int;
-type Fn_pa_simple_flush = unsafe extern "C" fn(s: *mut pa_simple, error: *mut c_int) -> c_int;
-/// Returns latency in microseconds (`pa_usec_t = u64`), or `(pa_usec_t)-1`
-/// via `error` on failure.
-type Fn_pa_simple_get_latency = unsafe extern "C" fn(s: *mut pa_simple, error: *mut c_int) -> u64;
-type Fn_pa_strerror = unsafe extern "C" fn(error: c_int) -> *const c_char;
-
-struct PulseLib {
-    _lib: Library,
-    pa_simple_new: Fn_pa_simple_new,
-    pa_simple_free: Fn_pa_simple_free,
-    pa_simple_write: Fn_pa_simple_write,
-    /// Resolved-but-unused today; kept around because closing out
-    /// gracefully is going to want it once we add a `drain()` surface.
-    #[allow(dead_code)]
-    pa_simple_drain: Fn_pa_simple_drain,
-    pa_simple_flush: Fn_pa_simple_flush,
-    pa_simple_get_latency: Fn_pa_simple_get_latency,
-    pa_strerror: Fn_pa_strerror,
+dlsym::library! {
+    /// `libpulse-simple.so.0` — the blocking "simple" playback API.
+    struct PulseLib {
+        unsafe extern "C" {
+            fn pa_simple_new(
+                server: *const c_char,
+                name: *const c_char,
+                dir: c_int,
+                dev: *const c_char,
+                stream_name: *const c_char,
+                ss: *const pa_sample_spec,
+                map: *const c_void,
+                attr: *const pa_buffer_attr,
+                error: *mut c_int,
+            ) -> *mut pa_simple;
+            fn pa_simple_free(s: *mut pa_simple);
+            fn pa_simple_write(
+                s: *mut pa_simple,
+                data: *const c_void,
+                bytes: usize,
+                error: *mut c_int,
+            ) -> c_int;
+            /// Resolved-but-unused today; kept around because closing out
+            /// gracefully is going to want it once we add a `drain()` surface.
+            #[allow(dead_code)]
+            fn pa_simple_drain(s: *mut pa_simple, error: *mut c_int) -> c_int;
+            fn pa_simple_flush(s: *mut pa_simple, error: *mut c_int) -> c_int;
+            /// Returns latency in microseconds (`pa_usec_t = u64`), or `(pa_usec_t)-1`
+            /// via `error` on failure.
+            fn pa_simple_get_latency(s: *mut pa_simple, error: *mut c_int) -> u64;
+            fn pa_strerror(error: c_int) -> *const c_char;
+        }
+    }
 }
 
-unsafe impl Send for PulseLib {}
-unsafe impl Sync for PulseLib {}
+/// The symbols `PulseLib` binds, for [`bind_error`]'s `SymbolMissing` naming.
+const PULSE_SYMBOLS: &[&str] = &[
+    "pa_simple_new",
+    "pa_simple_free",
+    "pa_simple_write",
+    "pa_simple_drain",
+    "pa_simple_flush",
+    "pa_simple_get_latency",
+    "pa_strerror",
+];
 
 impl PulseLib {
-    fn load() -> Result<Arc<Self>> {
-        unsafe {
-            let lib = Library::new("libpulse-simple.so.0").map_err(|e| Error::LibraryLoad {
-                backend: "pulse",
-                soname: "libpulse-simple.so.0",
-                source: e,
-            })?;
-            macro_rules! sym {
-                ($name:ident, $ty:ty) => {{
-                    let s: Symbol<$ty> = lib
-                        .get(concat!(stringify!($name), "\0").as_bytes())
-                        .map_err(|e| Error::SymbolMissing {
-                            backend: "pulse",
-                            symbol: stringify!($name),
-                            source: e,
-                        })?;
-                    *s
-                }};
-            }
-            Ok(Arc::new(PulseLib {
-                pa_simple_new: sym!(pa_simple_new, Fn_pa_simple_new),
-                pa_simple_free: sym!(pa_simple_free, Fn_pa_simple_free),
-                pa_simple_write: sym!(pa_simple_write, Fn_pa_simple_write),
-                pa_simple_drain: sym!(pa_simple_drain, Fn_pa_simple_drain),
-                pa_simple_flush: sym!(pa_simple_flush, Fn_pa_simple_flush),
-                pa_simple_get_latency: sym!(pa_simple_get_latency, Fn_pa_simple_get_latency),
-                pa_strerror: sym!(pa_strerror, Fn_pa_strerror),
-                _lib: lib,
-            }))
-        }
+    fn load_default() -> Result<Arc<Self>> {
+        const SONAME: &str = "libpulse-simple.so.0";
+        // SAFETY: libpulse-simple's initialisers are trusted.
+        let lib = unsafe { Library::open(SONAME) }.map_err(|e| Error::LibraryLoad {
+            backend: "pulse",
+            soname: SONAME,
+            source: e,
+        })?;
+        <Self as Bindings>::load(lib)
+            .map(Arc::new)
+            .map_err(|e| bind_error("pulse", SONAME, PULSE_SYMBOLS, e))
     }
 
     fn strerror(&self, err: c_int) -> String {
         unsafe {
-            let p = (self.pa_strerror)(err);
+            let p = self.pa_strerror(err);
             if p.is_null() {
                 format!("pa error {err}")
             } else {
@@ -157,7 +142,7 @@ fn lib() -> Result<Arc<PulseLib>> {
     if let Some(l) = g.as_ref() {
         return Ok(l.clone());
     }
-    let l = PulseLib::load()?;
+    let l = PulseLib::load_default()?;
     *g = Some(l.clone());
     Ok(l)
 }
@@ -202,7 +187,7 @@ impl Backend for PulseBackend {
         "pulse"
     }
     fn description(&self) -> &'static str {
-        "PulseAudio (libpulse-simple.so.0 via libloading)"
+        "PulseAudio (libpulse-simple.so.0 via dlsym)"
     }
     fn probe(&self) -> Result<()> {
         let l = lib()?;
@@ -215,7 +200,7 @@ impl Backend for PulseBackend {
         let name = CString::new("probe").unwrap();
         unsafe {
             let mut err: c_int = 0;
-            let s = (l.pa_simple_new)(
+            let s = l.pa_simple_new(
                 ptr::null(),
                 app.as_ptr(),
                 PA_STREAM_PLAYBACK,
@@ -232,7 +217,7 @@ impl Backend for PulseBackend {
                     detail: l.strerror(err),
                 });
             }
-            (l.pa_simple_free)(s);
+            l.pa_simple_free(s);
         }
         Ok(())
     }
@@ -287,7 +272,7 @@ impl Backend for PulseBackend {
 
         let handle = unsafe {
             let mut err: c_int = 0;
-            let s = (l.pa_simple_new)(
+            let s = l.pa_simple_new(
                 ptr::null(),
                 app.as_ptr(),
                 PA_STREAM_PLAYBACK,
@@ -338,7 +323,7 @@ impl Backend for PulseBackend {
             .spawn(move || state.run())
             .map_err(|e| {
                 // Worker failed to spawn — clean the stream up before bailing.
-                unsafe { (l.pa_simple_free)(handle) };
+                unsafe { l.pa_simple_free(handle) };
                 Error::Runtime {
                     backend: "pulse",
                     detail: format!("spawn worker: {e}"),
@@ -400,7 +385,7 @@ impl PulseWorkerState {
 
             unsafe {
                 let mut err: c_int = 0;
-                let r = (self.lib.pa_simple_write)(
+                let r = self.lib.pa_simple_write(
                     self.handle.0,
                     buf.as_ptr() as *const c_void,
                     bytes,
@@ -421,7 +406,7 @@ impl PulseWorkerState {
             // player gets a useful value for A/V sync compensation.
             unsafe {
                 let mut err: c_int = 0;
-                let usec = (self.lib.pa_simple_get_latency)(self.handle.0, &mut err);
+                let usec = self.lib.pa_simple_get_latency(self.handle.0, &mut err);
                 if usec != u64::MAX {
                     self.latency_usec.store(usec, Ordering::Relaxed);
                 }
@@ -465,8 +450,8 @@ impl StreamImpl for PulseStream {
         }
         unsafe {
             let mut err: c_int = 0;
-            let _ = (self.lib.pa_simple_flush)(self.handle.0, &mut err);
-            (self.lib.pa_simple_free)(self.handle.0);
+            let _ = self.lib.pa_simple_flush(self.handle.0, &mut err);
+            self.lib.pa_simple_free(self.handle.0);
         }
     }
 }

@@ -1,6 +1,6 @@
 //! ALSA output backend.
 //!
-//! Loads `libasound.so.2` at runtime through `libloading` and drives a
+//! Loads `libasound.so.2` at runtime through `dlsym` and drives a
 //! playback PCM via the `snd_pcm_*` family. Because ALSA's blocking
 //! `snd_pcm_writei` doesn't naturally fit a pull-callback model, we
 //! spawn a worker thread that loops: invoke the user callback, convert
@@ -17,8 +17,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use libloading::{Library, Symbol};
+use dlsym::{Bindings, Library};
 
+use super::bind_error;
 use crate::backend::{Backend, Callback};
 use crate::format::{CallbackInfo, Device, SampleFormat, StreamFormat, StreamRequest};
 use crate::stream::StreamImpl;
@@ -49,260 +50,184 @@ struct snd_pcm_hw_params_t {
     _private: [u8; 0],
 }
 
-// Function-pointer type aliases, kept with ALSA's spelling.
-type Fn_snd_pcm_open = unsafe extern "C" fn(
-    pcmp: *mut *mut snd_pcm_t,
-    name: *const c_char,
-    stream: c_int,
-    mode: c_int,
-) -> c_int;
-type Fn_snd_pcm_close = unsafe extern "C" fn(pcm: *mut snd_pcm_t) -> c_int;
-type Fn_snd_pcm_prepare = unsafe extern "C" fn(pcm: *mut snd_pcm_t) -> c_int;
-type Fn_snd_pcm_writei =
-    unsafe extern "C" fn(pcm: *mut snd_pcm_t, buffer: *const c_void, size: c_ulong) -> c_long;
-type Fn_snd_pcm_recover =
-    unsafe extern "C" fn(pcm: *mut snd_pcm_t, err: c_int, silent: c_int) -> c_int;
-type Fn_snd_pcm_drop = unsafe extern "C" fn(pcm: *mut snd_pcm_t) -> c_int;
-type Fn_snd_pcm_pause = unsafe extern "C" fn(pcm: *mut snd_pcm_t, enable: c_int) -> c_int;
-type Fn_snd_pcm_delay = unsafe extern "C" fn(pcm: *mut snd_pcm_t, delayp: *mut c_long) -> c_int;
-type Fn_snd_strerror = unsafe extern "C" fn(errnum: c_int) -> *const c_char;
+dlsym::library! {
+    /// `libasound.so.2`, with ALSA's spelling for the required PCM /
+    /// hw_params surface. The name-hint trio and `set_channels_near`
+    /// are `#[optional]`: a libasound old enough to lack them still
+    /// plays audio, it just can't enumerate (or hint a channel count).
+    struct Asound {
+        unsafe extern "C" {
+            fn snd_pcm_open(
+                pcmp: *mut *mut snd_pcm_t,
+                name: *const c_char,
+                stream: c_int,
+                mode: c_int,
+            ) -> c_int;
+            fn snd_pcm_close(pcm: *mut snd_pcm_t) -> c_int;
+            fn snd_pcm_prepare(pcm: *mut snd_pcm_t) -> c_int;
+            fn snd_pcm_writei(pcm: *mut snd_pcm_t, buffer: *const c_void, size: c_ulong) -> c_long;
+            fn snd_pcm_recover(pcm: *mut snd_pcm_t, err: c_int, silent: c_int) -> c_int;
+            fn snd_pcm_drop(pcm: *mut snd_pcm_t) -> c_int;
+            fn snd_pcm_pause(pcm: *mut snd_pcm_t, enable: c_int) -> c_int;
+            fn snd_pcm_delay(pcm: *mut snd_pcm_t, delayp: *mut c_long) -> c_int;
+            fn snd_strerror(errnum: c_int) -> *const c_char;
 
-// Device-enumeration ("name hint") API. `snd_device_name_hint` fills a
-// NULL-terminated array of opaque hint pointers; each pointer answers
-// `snd_device_name_get_hint(hint, key)` for keys "NAME" / "DESC" /
-// "IOID" with a freshly malloc'd C string (caller frees with the libc
-// `free`, which we reach via `snd_device_name_free_hint` for the array
-// and a stored libc `free` for the individual strings — but ALSA docs
-// say the per-string buffers are also freed by `free`; we keep them
-// short-lived and free each immediately). The whole array is released
-// by `snd_device_name_free_hint`.
-type Fn_snd_device_name_hint =
-    unsafe extern "C" fn(card: c_int, iface: *const c_char, hints: *mut *mut *mut c_void) -> c_int;
-type Fn_snd_device_name_get_hint =
-    unsafe extern "C" fn(hint: *const c_void, id: *const c_char) -> *mut c_char;
-type Fn_snd_device_name_free_hint = unsafe extern "C" fn(hints: *mut *mut c_void) -> c_int;
+            // Device-enumeration ("name hint") API. `snd_device_name_hint` fills a
+            // NULL-terminated array of opaque hint pointers; each pointer answers
+            // `snd_device_name_get_hint(hint, key)` for keys "NAME" / "DESC" /
+            // "IOID" with a freshly malloc'd C string (caller frees with the libc
+            // `free`, which we reach via `snd_device_name_free_hint` for the array
+            // and a stored libc `free` for the individual strings — but ALSA docs
+            // say the per-string buffers are also freed by `free`; we keep them
+            // short-lived and free each immediately). The whole array is released
+            // by `snd_device_name_free_hint`. Present on every libasound since
+            // 1.0.14 (2007) but resolved defensively so a missing one degrades
+            // enumeration to empty rather than failing the whole load.
+            #[optional]
+            fn snd_device_name_hint(
+                card: c_int,
+                iface: *const c_char,
+                hints: *mut *mut *mut c_void,
+            ) -> c_int;
+            #[optional]
+            fn snd_device_name_get_hint(hint: *const c_void, id: *const c_char) -> *mut c_char;
+            #[optional]
+            fn snd_device_name_free_hint(hints: *mut *mut c_void) -> c_int;
 
-type Fn_hw_params_malloc = unsafe extern "C" fn(ptr: *mut *mut snd_pcm_hw_params_t) -> c_int;
-type Fn_hw_params_free = unsafe extern "C" fn(obj: *mut snd_pcm_hw_params_t);
-type Fn_hw_params_any =
-    unsafe extern "C" fn(pcm: *mut snd_pcm_t, params: *mut snd_pcm_hw_params_t) -> c_int;
-type Fn_hw_params_set_access = unsafe extern "C" fn(
-    pcm: *mut snd_pcm_t,
-    params: *mut snd_pcm_hw_params_t,
-    access: c_int,
-) -> c_int;
-type Fn_hw_params_set_format = unsafe extern "C" fn(
-    pcm: *mut snd_pcm_t,
-    params: *mut snd_pcm_hw_params_t,
-    format: c_int,
-) -> c_int;
-type Fn_hw_params_set_channels = unsafe extern "C" fn(
-    pcm: *mut snd_pcm_t,
-    params: *mut snd_pcm_hw_params_t,
-    val: c_uint,
-) -> c_int;
-type Fn_hw_params_set_channels_near = unsafe extern "C" fn(
-    pcm: *mut snd_pcm_t,
-    params: *mut snd_pcm_hw_params_t,
-    val: *mut c_uint,
-) -> c_int;
-type Fn_hw_params_set_rate_near = unsafe extern "C" fn(
-    pcm: *mut snd_pcm_t,
-    params: *mut snd_pcm_hw_params_t,
-    val: *mut c_uint,
-    dir: *mut c_int,
-) -> c_int;
-type Fn_hw_params_set_period_size_near = unsafe extern "C" fn(
-    pcm: *mut snd_pcm_t,
-    params: *mut snd_pcm_hw_params_t,
-    val: *mut c_ulong,
-    dir: *mut c_int,
-) -> c_int;
-type Fn_hw_params_set_buffer_size_near = unsafe extern "C" fn(
-    pcm: *mut snd_pcm_t,
-    params: *mut snd_pcm_hw_params_t,
-    val: *mut c_ulong,
-) -> c_int;
-type Fn_hw_params_get_period_size = unsafe extern "C" fn(
-    params: *const snd_pcm_hw_params_t,
-    val: *mut c_ulong,
-    dir: *mut c_int,
-) -> c_int;
-type Fn_hw_params =
-    unsafe extern "C" fn(pcm: *mut snd_pcm_t, params: *mut snd_pcm_hw_params_t) -> c_int;
+            #[link_name = "snd_pcm_hw_params_malloc"]
+            fn hw_params_malloc(ptr: *mut *mut snd_pcm_hw_params_t) -> c_int;
+            #[link_name = "snd_pcm_hw_params_free"]
+            fn hw_params_free(obj: *mut snd_pcm_hw_params_t);
+            #[link_name = "snd_pcm_hw_params_any"]
+            fn hw_params_any(pcm: *mut snd_pcm_t, params: *mut snd_pcm_hw_params_t) -> c_int;
+            #[link_name = "snd_pcm_hw_params_set_access"]
+            fn hw_params_set_access(
+                pcm: *mut snd_pcm_t,
+                params: *mut snd_pcm_hw_params_t,
+                access: c_int,
+            ) -> c_int;
+            #[link_name = "snd_pcm_hw_params_set_format"]
+            fn hw_params_set_format(
+                pcm: *mut snd_pcm_t,
+                params: *mut snd_pcm_hw_params_t,
+                format: c_int,
+            ) -> c_int;
+            #[link_name = "snd_pcm_hw_params_set_channels"]
+            fn hw_params_set_channels(
+                pcm: *mut snd_pcm_t,
+                params: *mut snd_pcm_hw_params_t,
+                val: c_uint,
+            ) -> c_int;
+            /// Channel-count negotiation analogue of `set_rate_near` — clamps
+            /// the requested count into the device's supported range and writes
+            /// the snapped value back through the mutable arg. Optional so a
+            /// libasound old enough to lack it just degrades `preferred_format`
+            /// to "no channel-count hint" rather than failing the whole load.
+            #[optional]
+            #[link_name = "snd_pcm_hw_params_set_channels_near"]
+            fn hw_params_set_channels_near(
+                pcm: *mut snd_pcm_t,
+                params: *mut snd_pcm_hw_params_t,
+                val: *mut c_uint,
+            ) -> c_int;
+            #[link_name = "snd_pcm_hw_params_set_rate_near"]
+            fn hw_params_set_rate_near(
+                pcm: *mut snd_pcm_t,
+                params: *mut snd_pcm_hw_params_t,
+                val: *mut c_uint,
+                dir: *mut c_int,
+            ) -> c_int;
+            #[link_name = "snd_pcm_hw_params_set_period_size_near"]
+            fn hw_params_set_period_size_near(
+                pcm: *mut snd_pcm_t,
+                params: *mut snd_pcm_hw_params_t,
+                val: *mut c_ulong,
+                dir: *mut c_int,
+            ) -> c_int;
+            #[link_name = "snd_pcm_hw_params_set_buffer_size_near"]
+            fn hw_params_set_buffer_size_near(
+                pcm: *mut snd_pcm_t,
+                params: *mut snd_pcm_hw_params_t,
+                val: *mut c_ulong,
+            ) -> c_int;
+            #[link_name = "snd_pcm_hw_params_get_period_size"]
+            fn hw_params_get_period_size(
+                params: *const snd_pcm_hw_params_t,
+                val: *mut c_ulong,
+                dir: *mut c_int,
+            ) -> c_int;
+            #[link_name = "snd_pcm_hw_params"]
+            fn hw_params(pcm: *mut snd_pcm_t, params: *mut snd_pcm_hw_params_t) -> c_int;
+        }
+    }
+}
+
+/// The required symbols `Asound` binds (as libasound exports them), for
+/// [`bind_error`]'s `SymbolMissing` naming.
+const ASOUND_SYMBOLS: &[&str] = &[
+    "snd_pcm_open",
+    "snd_pcm_close",
+    "snd_pcm_prepare",
+    "snd_pcm_writei",
+    "snd_pcm_recover",
+    "snd_pcm_drop",
+    "snd_pcm_pause",
+    "snd_pcm_delay",
+    "snd_strerror",
+    "snd_pcm_hw_params_malloc",
+    "snd_pcm_hw_params_free",
+    "snd_pcm_hw_params_any",
+    "snd_pcm_hw_params_set_access",
+    "snd_pcm_hw_params_set_format",
+    "snd_pcm_hw_params_set_channels",
+    "snd_pcm_hw_params_set_rate_near",
+    "snd_pcm_hw_params_set_period_size_near",
+    "snd_pcm_hw_params_set_buffer_size_near",
+    "snd_pcm_hw_params_get_period_size",
+    "snd_pcm_hw_params",
+];
+
+dlsym::library! {
+    /// libc's `free`, used to release the per-hint strings ALSA hands back.
+    struct LibcFree {
+        unsafe extern "C" {
+            fn free(p: *mut c_void);
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Loaded library + resolved symbols.
 // ---------------------------------------------------------------------------
 
 struct AlsaLib {
-    _lib: Library,
-    snd_pcm_open: Fn_snd_pcm_open,
-    snd_pcm_close: Fn_snd_pcm_close,
-    snd_pcm_prepare: Fn_snd_pcm_prepare,
-    snd_pcm_writei: Fn_snd_pcm_writei,
-    snd_pcm_recover: Fn_snd_pcm_recover,
-    snd_pcm_drop: Fn_snd_pcm_drop,
-    snd_pcm_pause: Fn_snd_pcm_pause,
-    snd_pcm_delay: Fn_snd_pcm_delay,
-    snd_strerror: Fn_snd_strerror,
-
-    // Device-enumeration symbols + the libc `free` used to release the
-    // per-hint strings ALSA hands back. `free_fn` / the hint symbols are
-    // `Option` because they are not strictly required to open a stream;
-    // a libasound old enough to lack the name-hint API still plays
-    // audio, it just can't enumerate.
-    snd_device_name_hint: Option<Fn_snd_device_name_hint>,
-    snd_device_name_get_hint: Option<Fn_snd_device_name_get_hint>,
-    snd_device_name_free_hint: Option<Fn_snd_device_name_free_hint>,
-    free_fn: Option<unsafe extern "C" fn(*mut c_void)>,
-    // Keep the libc handle alive so `free_fn` stays mapped.
-    _libc: Option<Library>,
-
-    hw_params_malloc: Fn_hw_params_malloc,
-    hw_params_free: Fn_hw_params_free,
-    hw_params_any: Fn_hw_params_any,
-    hw_params_set_access: Fn_hw_params_set_access,
-    hw_params_set_format: Fn_hw_params_set_format,
-    hw_params_set_channels: Fn_hw_params_set_channels,
-    /// Channel-count negotiation analogue of `set_rate_near` — clamps
-    /// the requested count into the device's supported range and writes
-    /// the snapped value back through the mutable arg. Optional so a
-    /// libasound old enough to lack it just degrades `preferred_format`
-    /// to "no channel-count hint" rather than failing the whole load.
-    hw_params_set_channels_near: Option<Fn_hw_params_set_channels_near>,
-    hw_params_set_rate_near: Fn_hw_params_set_rate_near,
-    hw_params_set_period_size_near: Fn_hw_params_set_period_size_near,
-    hw_params_set_buffer_size_near: Fn_hw_params_set_buffer_size_near,
-    hw_params_get_period_size: Fn_hw_params_get_period_size,
-    hw_params: Fn_hw_params,
+    asound: Asound,
+    /// libc `free` for the malloc'd hint strings. `None` means
+    /// enumeration leaks the per-hint strings (bounded — a one-shot
+    /// enumeration), so the load never fails on its account.
+    libc: Option<LibcFree>,
 }
 
-// SAFETY: libalsa's `snd_pcm_*` calls are thread-safe per-handle; we
-// never share a handle across threads without a Mutex. The function
-// pointers themselves are immutable after load.
-unsafe impl Send for AlsaLib {}
-unsafe impl Sync for AlsaLib {}
-
 impl AlsaLib {
-    fn load() -> Result<Arc<Self>> {
-        unsafe {
-            let lib = Library::new("libasound.so.2").map_err(|e| Error::LibraryLoad {
-                backend: "alsa",
-                soname: "libasound.so.2",
-                source: e,
-            })?;
-            macro_rules! sym {
-                ($name:ident, $ty:ty) => {{
-                    let s: Symbol<$ty> = lib
-                        .get(concat!(stringify!($name), "\0").as_bytes())
-                        .map_err(|e| Error::SymbolMissing {
-                            backend: "alsa",
-                            symbol: stringify!($name),
-                            source: e,
-                        })?;
-                    // Deref copies the fn-pointer out; the borrow on
-                    // `lib` ends here, and the fn pointer remains valid
-                    // as long as we keep the Library alive in AlsaLib.
-                    *s
-                }};
-            }
-            let snd_pcm_open = sym!(snd_pcm_open, Fn_snd_pcm_open);
-            let snd_pcm_close = sym!(snd_pcm_close, Fn_snd_pcm_close);
-            let snd_pcm_prepare = sym!(snd_pcm_prepare, Fn_snd_pcm_prepare);
-            let snd_pcm_writei = sym!(snd_pcm_writei, Fn_snd_pcm_writei);
-            let snd_pcm_recover = sym!(snd_pcm_recover, Fn_snd_pcm_recover);
-            let snd_pcm_drop = sym!(snd_pcm_drop, Fn_snd_pcm_drop);
-            let snd_pcm_pause = sym!(snd_pcm_pause, Fn_snd_pcm_pause);
-            let snd_pcm_delay = sym!(snd_pcm_delay, Fn_snd_pcm_delay);
-            let snd_strerror = sym!(snd_strerror, Fn_snd_strerror);
-
-            // Optional name-hint symbols — present on every libasound
-            // since 1.0.14 (2007) but resolved defensively so a missing
-            // one degrades enumeration to empty rather than failing the
-            // whole load.
-            macro_rules! opt_sym {
-                ($name:ident, $ty:ty) => {{
-                    let r: std::result::Result<Symbol<$ty>, _> =
-                        lib.get(concat!(stringify!($name), "\0").as_bytes());
-                    r.ok().map(|s| *s)
-                }};
-            }
-            let snd_device_name_hint = opt_sym!(snd_device_name_hint, Fn_snd_device_name_hint);
-            let snd_device_name_get_hint =
-                opt_sym!(snd_device_name_get_hint, Fn_snd_device_name_get_hint);
-            let snd_device_name_free_hint =
-                opt_sym!(snd_device_name_free_hint, Fn_snd_device_name_free_hint);
-
-            // libc `free` for the malloc'd hint strings. Try the common
-            // sonames; if none load, enumeration leaks the per-hint
-            // strings (bounded — a one-shot enumeration), so we keep
-            // `free_fn` optional and never fail the load on its account.
-            let (libc, free_fn) = load_libc_free();
-
-            let hw_params_malloc = sym!(snd_pcm_hw_params_malloc, Fn_hw_params_malloc);
-            let hw_params_free = sym!(snd_pcm_hw_params_free, Fn_hw_params_free);
-            let hw_params_any = sym!(snd_pcm_hw_params_any, Fn_hw_params_any);
-            let hw_params_set_access = sym!(snd_pcm_hw_params_set_access, Fn_hw_params_set_access);
-            let hw_params_set_format = sym!(snd_pcm_hw_params_set_format, Fn_hw_params_set_format);
-            let hw_params_set_channels =
-                sym!(snd_pcm_hw_params_set_channels, Fn_hw_params_set_channels);
-            // Optional — degrades `preferred_format` only.
-            let hw_params_set_channels_near = opt_sym!(
-                snd_pcm_hw_params_set_channels_near,
-                Fn_hw_params_set_channels_near
-            );
-            let hw_params_set_rate_near =
-                sym!(snd_pcm_hw_params_set_rate_near, Fn_hw_params_set_rate_near);
-            let hw_params_set_period_size_near = sym!(
-                snd_pcm_hw_params_set_period_size_near,
-                Fn_hw_params_set_period_size_near
-            );
-            let hw_params_set_buffer_size_near = sym!(
-                snd_pcm_hw_params_set_buffer_size_near,
-                Fn_hw_params_set_buffer_size_near
-            );
-            let hw_params_get_period_size = sym!(
-                snd_pcm_hw_params_get_period_size,
-                Fn_hw_params_get_period_size
-            );
-            let hw_params = sym!(snd_pcm_hw_params, Fn_hw_params);
-
-            Ok(Arc::new(AlsaLib {
-                _lib: lib,
-                snd_pcm_open,
-                snd_pcm_close,
-                snd_pcm_prepare,
-                snd_pcm_writei,
-                snd_pcm_recover,
-                snd_pcm_drop,
-                snd_pcm_pause,
-                snd_pcm_delay,
-                snd_strerror,
-                snd_device_name_hint,
-                snd_device_name_get_hint,
-                snd_device_name_free_hint,
-                free_fn,
-                _libc: libc,
-                hw_params_malloc,
-                hw_params_free,
-                hw_params_any,
-                hw_params_set_access,
-                hw_params_set_format,
-                hw_params_set_channels,
-                hw_params_set_channels_near,
-                hw_params_set_rate_near,
-                hw_params_set_period_size_near,
-                hw_params_set_buffer_size_near,
-                hw_params_get_period_size,
-                hw_params,
-            }))
-        }
+    fn load_default() -> Result<Arc<Self>> {
+        const SONAME: &str = "libasound.so.2";
+        // SAFETY: libasound's initialisers are trusted.
+        let lib = unsafe { Library::open(SONAME) }.map_err(|e| Error::LibraryLoad {
+            backend: "alsa",
+            soname: SONAME,
+            source: e,
+        })?;
+        let asound = <Asound as Bindings>::load(lib)
+            .map_err(|e| bind_error("alsa", SONAME, ASOUND_SYMBOLS, e))?;
+        Ok(Arc::new(AlsaLib {
+            asound,
+            libc: load_libc_free(),
+        }))
     }
 
     fn strerror(&self, err: c_int) -> String {
         unsafe {
-            let p = (self.snd_strerror)(err);
+            let p = self.asound.snd_strerror(err);
             if p.is_null() {
                 format!("alsa error {err}")
             } else {
@@ -317,14 +242,13 @@ impl AlsaLib {
     /// (ALSA returns NULL — e.g. IOID is NULL for a duplex device).
     unsafe fn get_hint(&self, hint: *const c_void, key: &CStr) -> Option<String> {
         unsafe {
-            let get = self.snd_device_name_get_hint?;
-            let raw = get(hint, key.as_ptr());
+            let raw = self.asound.snd_device_name_get_hint(hint, key.as_ptr())?;
             if raw.is_null() {
                 return None;
             }
             let owned = CStr::from_ptr(raw).to_string_lossy().into_owned();
-            if let Some(free) = self.free_fn {
-                free(raw as *mut c_void);
+            if let Some(libc) = &self.libc {
+                libc.free(raw as *mut c_void);
             }
             Some(owned)
         }
@@ -337,13 +261,6 @@ impl AlsaLib {
     /// "Output" / NULL=both). We keep hints whose IOID is Output or
     /// unset, and tag the one named `"default"` as the system default.
     fn enumerate(&self) -> Result<Vec<Device>> {
-        let hint_fn = self
-            .snd_device_name_hint
-            .ok_or(Error::NotImplemented("alsa"))?;
-        let free_hint_fn = self
-            .snd_device_name_free_hint
-            .ok_or(Error::NotImplemented("alsa"))?;
-
         let iface = CString::new("pcm").unwrap();
         let key_name = CString::new("NAME").unwrap();
         let key_desc = CString::new("DESC").unwrap();
@@ -352,8 +269,12 @@ impl AlsaLib {
         let mut out = Vec::new();
         unsafe {
             let mut hints: *mut *mut c_void = ptr::null_mut();
-            // card = -1 means "all cards".
-            let r = hint_fn(-1, iface.as_ptr(), &mut hints);
+            // card = -1 means "all cards". A libasound without the
+            // name-hint API (pre-1.0.14) cannot enumerate at all.
+            let r = self
+                .asound
+                .snd_device_name_hint(-1, iface.as_ptr(), &mut hints)
+                .ok_or(Error::NotImplemented("alsa"))?;
             if r < 0 {
                 return Err(Error::Runtime {
                     backend: "alsa",
@@ -393,33 +314,28 @@ impl AlsaLib {
                 }
                 p = p.add(1);
             }
-            free_hint_fn(hints);
+            // `free_hint` ships together with `name_hint`; should a
+            // libasound somehow lack only it, the one-shot hint array
+            // leaks rather than the enumeration failing.
+            let _ = self.asound.snd_device_name_free_hint(hints);
         }
         Ok(out)
     }
 }
 
-/// Resolve libc's `free`, returning the owning `Library` (kept alive in
-/// `AlsaLib`) plus the function pointer. Best-effort: a `None` result
-/// just means the name-hint strings leak per enumeration call, which is
-/// bounded and never breaks playback.
-fn load_libc_free() -> (Option<Library>, Option<unsafe extern "C" fn(*mut c_void)>) {
+/// Resolve libc's `free` into its own owning binding (kept alive in
+/// `AlsaLib`). Best-effort: a `None` result just means the name-hint
+/// strings leak per enumeration call, which is bounded and never
+/// breaks playback.
+fn load_libc_free() -> Option<LibcFree> {
     // Glibc, musl, and the BSD-flavoured libc on some distros all expose
     // `free` from one of these sonames. We deliberately do not depend on
     // the `libc` crate — staying header- and link-free is this crate's
     // whole premise.
     const CANDIDATES: &[&str] = &["libc.so.6", "libc.so", "libc.musl-x86_64.so.1"];
-    for &name in CANDIDATES {
-        if let Ok(lib) = unsafe { Library::new(name) } {
-            let f: std::result::Result<Symbol<unsafe extern "C" fn(*mut c_void)>, _> =
-                unsafe { lib.get(b"free\0") };
-            if let Ok(sym) = f {
-                let ptr = *sym;
-                return (Some(lib), Some(ptr));
-            }
-        }
-    }
-    (None, None)
+    // SAFETY: libc is already loaded in this process; re-opening it
+    // runs no initialiser we do not already trust.
+    unsafe { LibcFree::open_first(CANDIDATES) }.ok()
 }
 
 // Cached so we don't dlopen once per stream.
@@ -430,7 +346,7 @@ fn lib() -> Result<Arc<AlsaLib>> {
     if let Some(l) = guard.as_ref() {
         return Ok(l.clone());
     }
-    let l = AlsaLib::load()?;
+    let l = AlsaLib::load_default()?;
     *guard = Some(l.clone());
     Ok(l)
 }
@@ -446,7 +362,7 @@ impl Backend for AlsaBackend {
         "alsa"
     }
     fn description(&self) -> &'static str {
-        "ALSA (libasound.so.2 via libloading)"
+        "ALSA (libasound.so.2 via dlsym)"
     }
 
     fn probe(&self) -> Result<()> {
@@ -454,7 +370,7 @@ impl Backend for AlsaBackend {
         unsafe {
             let mut pcm: *mut snd_pcm_t = ptr::null_mut();
             let name = CString::new("default").unwrap();
-            let r = (l.snd_pcm_open)(
+            let r = l.asound.snd_pcm_open(
                 &mut pcm,
                 name.as_ptr(),
                 SND_PCM_STREAM_PLAYBACK,
@@ -466,7 +382,7 @@ impl Backend for AlsaBackend {
                     detail: l.strerror(r),
                 });
             }
-            (l.snd_pcm_close)(pcm);
+            l.asound.snd_pcm_close(pcm);
         }
         Ok(())
     }
@@ -503,7 +419,7 @@ impl Backend for AlsaBackend {
             // NONBLOCK so a busy device doesn't make `preferred_format`
             // wait for it — we just want to read the param-space
             // metadata, not drive samples.
-            let r = (l.snd_pcm_open)(
+            let r = l.asound.snd_pcm_open(
                 &mut pcm,
                 name.as_ptr(),
                 SND_PCM_STREAM_PLAYBACK,
@@ -517,7 +433,7 @@ impl Backend for AlsaBackend {
             }
             // From here on we must close `pcm` on every exit path.
             let res = preferred_format_inner(&l, pcm);
-            (l.snd_pcm_close)(pcm);
+            l.asound.snd_pcm_close(pcm);
             res
         }
     }
@@ -535,12 +451,12 @@ unsafe fn preferred_format_inner(l: &AlsaLib, pcm: *mut snd_pcm_t) -> Result<Str
         }
         impl<'a> Drop for LocalHwGuard<'a> {
             fn drop(&mut self) {
-                unsafe { (self.l.hw_params_free)(self.hw) };
+                unsafe { self.l.asound.hw_params_free(self.hw) };
             }
         }
 
         let mut hw: *mut snd_pcm_hw_params_t = ptr::null_mut();
-        let r = (l.hw_params_malloc)(&mut hw);
+        let r = l.asound.hw_params_malloc(&mut hw);
         if r < 0 {
             return Err(Error::DeviceOpen {
                 backend: "alsa",
@@ -550,18 +466,23 @@ unsafe fn preferred_format_inner(l: &AlsaLib, pcm: *mut snd_pcm_t) -> Result<Str
         let _guard = LocalHwGuard { l, hw };
 
         // Load the full parameter superset for the device.
-        check(l, (l.hw_params_any)(pcm, hw), "hw_params_any")?;
+        check(l, l.asound.hw_params_any(pcm, hw), "hw_params_any")?;
         // Sample format — mirror the open path's preference (FLOAT_LE, fall
         // back to S16_LE). The public callback surface stays F32 either way;
         // the open path silently converts S16<->F32 for old devices. So the
         // *reported* format here is always F32 — what we're really probing
         // for is whether the device will accept the open path at all.
-        let format = if (l.hw_params_set_format)(pcm, hw, SND_PCM_FORMAT_FLOAT_LE) == 0 {
+        let format = if l
+            .asound
+            .hw_params_set_format(pcm, hw, SND_PCM_FORMAT_FLOAT_LE)
+            == 0
+        {
             SampleFormat::F32
         } else {
             check(
                 l,
-                (l.hw_params_set_format)(pcm, hw, SND_PCM_FORMAT_S16_LE),
+                l.asound
+                    .hw_params_set_format(pcm, hw, SND_PCM_FORMAT_S16_LE),
                 "hw_params_set_format(S16_LE)",
             )?;
             SampleFormat::F32
@@ -572,12 +493,8 @@ unsafe fn preferred_format_inner(l: &AlsaLib, pcm: *mut snd_pcm_t) -> Result<Str
         // documented default. Stereo is the common reality and matches the
         // backend's other clamping (`channels.clamp(1, 8)` on `open`).
         let mut channels: c_uint = 2;
-        if let Some(set_near) = l.hw_params_set_channels_near {
-            check(
-                l,
-                set_near(pcm, hw, &mut channels),
-                "hw_params_set_channels_near",
-            )?;
+        if let Some(r) = l.asound.hw_params_set_channels_near(pcm, hw, &mut channels) {
+            check(l, r, "hw_params_set_channels_near")?;
         }
         // Sample-rate snap — canonical 48 kHz hint, exactly the path the
         // open() comment in lib.rs documents:
@@ -587,7 +504,8 @@ unsafe fn preferred_format_inner(l: &AlsaLib, pcm: *mut snd_pcm_t) -> Result<Str
         let mut dir: c_int = 0;
         check(
             l,
-            (l.hw_params_set_rate_near)(pcm, hw, &mut rate, &mut dir),
+            l.asound
+                .hw_params_set_rate_near(pcm, hw, &mut rate, &mut dir),
             "hw_params_set_rate_near",
         )?;
         Ok(StreamFormat {
@@ -615,7 +533,9 @@ unsafe fn open_inner(
             detail: "device id contains an interior NUL byte".into(),
         })?;
         let mut pcm: *mut snd_pcm_t = ptr::null_mut();
-        let r = (l.snd_pcm_open)(&mut pcm, name.as_ptr(), SND_PCM_STREAM_PLAYBACK, 0);
+        let r = l
+            .asound
+            .snd_pcm_open(&mut pcm, name.as_ptr(), SND_PCM_STREAM_PLAYBACK, 0);
         if r < 0 {
             return Err(Error::DeviceOpen {
                 backend: "alsa",
@@ -627,7 +547,7 @@ unsafe fn open_inner(
         match res {
             Ok(boxed) => Ok(boxed),
             Err(e) => {
-                (l.snd_pcm_close)(pcm);
+                l.asound.snd_pcm_close(pcm);
                 Err(e)
             }
         }
@@ -642,7 +562,7 @@ unsafe fn configure_and_spawn(
 ) -> Result<Box<dyn StreamImpl>> {
     unsafe {
         let mut hw: *mut snd_pcm_hw_params_t = ptr::null_mut();
-        let r = (l.hw_params_malloc)(&mut hw);
+        let r = l.asound.hw_params_malloc(&mut hw);
         if r < 0 {
             return Err(Error::DeviceOpen {
                 backend: "alsa",
@@ -651,22 +571,27 @@ unsafe fn configure_and_spawn(
         }
         let hw_guard = HwParamsGuard { l: l.clone(), hw };
 
-        check(&l, (l.hw_params_any)(pcm, hw), "hw_params_any")?;
+        check(&l, l.asound.hw_params_any(pcm, hw), "hw_params_any")?;
         check(
             &l,
-            (l.hw_params_set_access)(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED),
+            l.asound
+                .hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED),
             "hw_params_set_access",
         )?;
 
         // Prefer FLOAT_LE; fall back to S16_LE for devices that don't
         // advertise float (uncommon on modern drivers, common on embedded).
         let (device_fmt, device_fmt_is_f32) =
-            match (l.hw_params_set_format)(pcm, hw, SND_PCM_FORMAT_FLOAT_LE) {
+            match l
+                .asound
+                .hw_params_set_format(pcm, hw, SND_PCM_FORMAT_FLOAT_LE)
+            {
                 0 => (SND_PCM_FORMAT_FLOAT_LE, true),
                 _ => {
                     check(
                         &l,
-                        (l.hw_params_set_format)(pcm, hw, SND_PCM_FORMAT_S16_LE),
+                        l.asound
+                            .hw_params_set_format(pcm, hw, SND_PCM_FORMAT_S16_LE),
                         "hw_params_set_format(S16_LE)",
                     )?;
                     (SND_PCM_FORMAT_S16_LE, false)
@@ -677,7 +602,7 @@ unsafe fn configure_and_spawn(
         let want_ch = req.channels.clamp(1, 8) as c_uint;
         check(
             &l,
-            (l.hw_params_set_channels)(pcm, hw, want_ch),
+            l.asound.hw_params_set_channels(pcm, hw, want_ch),
             "hw_params_set_channels",
         )?;
 
@@ -685,7 +610,8 @@ unsafe fn configure_and_spawn(
         let mut dir: c_int = 0;
         check(
             &l,
-            (l.hw_params_set_rate_near)(pcm, hw, &mut rate, &mut dir),
+            l.asound
+                .hw_params_set_rate_near(pcm, hw, &mut rate, &mut dir),
             "hw_params_set_rate_near",
         )?;
 
@@ -699,21 +625,26 @@ unsafe fn configure_and_spawn(
         let mut dir2: c_int = 0;
         check(
             &l,
-            (l.hw_params_set_period_size_near)(pcm, hw, &mut period, &mut dir2),
+            l.asound
+                .hw_params_set_period_size_near(pcm, hw, &mut period, &mut dir2),
             "hw_params_set_period_size_near",
         )?;
 
         let mut buffer: c_ulong = period.saturating_mul(4);
-        let _ = (l.hw_params_set_buffer_size_near)(pcm, hw, &mut buffer); // best-effort
+        let _ = l
+            .asound
+            .hw_params_set_buffer_size_near(pcm, hw, &mut buffer); // best-effort
 
-        check(&l, (l.hw_params)(pcm, hw), "hw_params (commit)")?;
+        check(&l, l.asound.hw_params(pcm, hw), "hw_params (commit)")?;
 
         let mut period_actual: c_ulong = 0;
         let mut pd: c_int = 0;
-        let _ = (l.hw_params_get_period_size)(hw, &mut period_actual, &mut pd);
+        let _ = l
+            .asound
+            .hw_params_get_period_size(hw, &mut period_actual, &mut pd);
         drop(hw_guard);
 
-        check(&l, (l.snd_pcm_prepare)(pcm), "snd_pcm_prepare")?;
+        check(&l, l.asound.snd_pcm_prepare(pcm), "snd_pcm_prepare")?;
 
         let period_frames = period_actual.max(period) as usize;
         let channels = want_ch as usize;
@@ -776,7 +707,7 @@ struct HwParamsGuard {
 }
 impl Drop for HwParamsGuard {
     fn drop(&mut self) {
-        unsafe { (self.l.hw_params_free)(self.hw) }
+        unsafe { self.l.asound.hw_params_free(self.hw) }
     }
 }
 
@@ -820,7 +751,7 @@ impl AlsaWorkerState {
 
             let r = unsafe {
                 if self.device_fmt_is_f32 {
-                    (self.lib.snd_pcm_writei)(
+                    self.lib.asound.snd_pcm_writei(
                         self.pcm.0,
                         f32_buf.as_ptr() as *const c_void,
                         self.period_frames as c_ulong,
@@ -830,7 +761,7 @@ impl AlsaWorkerState {
                         let v = (s.clamp(-1.0, 1.0) * 32767.0) as i32;
                         *d = v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
                     }
-                    (self.lib.snd_pcm_writei)(
+                    self.lib.asound.snd_pcm_writei(
                         self.pcm.0,
                         s16_buf.as_ptr() as *const c_void,
                         self.period_frames as c_ulong,
@@ -839,7 +770,7 @@ impl AlsaWorkerState {
             };
             if r < 0 {
                 // -EPIPE / -ESTRPIPE / -EBADFD → ask ALSA to recover.
-                let rec = unsafe { (self.lib.snd_pcm_recover)(self.pcm.0, r as c_int, 1) };
+                let rec = unsafe { self.lib.asound.snd_pcm_recover(self.pcm.0, r as c_int, 1) };
                 if rec < 0 {
                     // Unrecoverable — bail.
                     return;
@@ -852,7 +783,7 @@ impl AlsaWorkerState {
             // Safe to call from this thread only (snd_pcm handles are
             // not thread-safe); readers get a stale-by-one-period view.
             let mut delay: c_long = 0;
-            let dr = unsafe { (self.lib.snd_pcm_delay)(self.pcm.0, &mut delay) };
+            let dr = unsafe { self.lib.asound.snd_pcm_delay(self.pcm.0, &mut delay) };
             if dr == 0 {
                 self.delay_frames.store(delay as i64, Ordering::Relaxed);
             }
@@ -882,13 +813,13 @@ impl StreamImpl for AlsaStream {
             // return -ENOTSUP for pause; ignore that — on those devices
             // the stream is always "playing" and we simulated pause
             // by writing silence from the callback instead.
-            let _ = (self.lib.snd_pcm_pause)(self.pcm.0, 0);
+            let _ = self.lib.asound.snd_pcm_pause(self.pcm.0, 0);
         }
         Ok(())
     }
     fn pause(&mut self) -> Result<()> {
         unsafe {
-            let _ = (self.lib.snd_pcm_pause)(self.pcm.0, 1);
+            let _ = self.lib.asound.snd_pcm_pause(self.pcm.0, 1);
         }
         Ok(())
     }
@@ -907,8 +838,8 @@ impl StreamImpl for AlsaStream {
             let _ = t.join();
         }
         unsafe {
-            let _ = (self.lib.snd_pcm_drop)(self.pcm.0);
-            let _ = (self.lib.snd_pcm_close)(self.pcm.0);
+            let _ = self.lib.asound.snd_pcm_drop(self.pcm.0);
+            let _ = self.lib.asound.snd_pcm_close(self.pcm.0);
         }
     }
 }

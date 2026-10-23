@@ -32,4 +32,4 @@ coreaudio = []
 mock = []
 
 [dependencies]
-libloading = "0.9"
+dlsym = "0.0.2"

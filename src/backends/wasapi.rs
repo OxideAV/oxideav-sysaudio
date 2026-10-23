@@ -2,8 +2,8 @@
 //!
 //! Uses `ole32.dll` (`CoInitializeEx`, `CoCreateInstance`,
 //! `CoTaskMemFree`) and `kernel32.dll` (`CreateEventA`, `SetEvent`,
-//! `WaitForSingleObject`, `CloseHandle`) through libloading — no COM
-//! bindings crate, no winapi, no windows-rs. The COM interfaces
+//! `WaitForSingleObject`, `CloseHandle`) through `dlsym` — no COM
+//! bindings crate. The COM interfaces
 //! (`IMMDeviceEnumerator`, `IMMDevice`, `IAudioClient`,
 //! `IAudioRenderClient`) are declared as bare `#[repr(C)]` vtables and
 //! invoked by hand.
@@ -31,8 +31,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use libloading::{Library, Symbol};
+use dlsym::{Bindings, Library};
 
+use super::bind_error;
 use crate::backend::{Backend, Callback};
 use crate::format::{CallbackInfo, Device, SampleFormat, StreamFormat, StreamRequest};
 use crate::stream::StreamImpl;
@@ -383,87 +384,86 @@ struct IAudioClockVtbl {
 // Loaded libraries — ole32 + kernel32
 // ---------------------------------------------------------------------------
 
-type Fn_CoInitializeEx =
-    unsafe extern "system" fn(pvReserved: *mut c_void, dwCoInit: DWORD) -> HRESULT;
-type Fn_CoUninitialize = unsafe extern "system" fn();
-type Fn_CoCreateInstance = unsafe extern "system" fn(
-    rclsid: *const GUID,
-    pUnkOuter: *mut c_void,
-    dwClsContext: DWORD,
-    riid: *const GUID,
-    ppv: *mut *mut c_void,
-) -> HRESULT;
-type Fn_CoTaskMemFree = unsafe extern "system" fn(pv: *mut c_void);
-type Fn_PropVariantClear = unsafe extern "system" fn(pvar: *mut PROPVARIANT) -> HRESULT;
-
-type Fn_CreateEventA = unsafe extern "system" fn(
-    lpEventAttributes: *mut c_void,
-    bManualReset: BOOL,
-    bInitialState: BOOL,
-    lpName: *const c_char,
-) -> HANDLE;
-type Fn_CloseHandle = unsafe extern "system" fn(hObject: HANDLE) -> BOOL;
-type Fn_WaitForSingleObject =
-    unsafe extern "system" fn(hHandle: HANDLE, dwMilliseconds: DWORD) -> DWORD;
-type Fn_SetEvent = unsafe extern "system" fn(hEvent: HANDLE) -> BOOL;
-
-struct WinLibs {
-    _ole32: Library,
-    _kernel32: Library,
-    CoInitializeEx: Fn_CoInitializeEx,
-    CoUninitialize: Fn_CoUninitialize,
-    CoCreateInstance: Fn_CoCreateInstance,
-    CoTaskMemFree: Fn_CoTaskMemFree,
-    PropVariantClear: Fn_PropVariantClear,
-    CreateEventA: Fn_CreateEventA,
-    CloseHandle: Fn_CloseHandle,
-    WaitForSingleObject: Fn_WaitForSingleObject,
-    SetEvent: Fn_SetEvent,
+dlsym::library! {
+    /// `ole32.dll` — COM bootstrap plus the two allocators COM hands
+    /// memory back through.
+    struct Ole32 {
+        unsafe extern "system" {
+            fn CoInitializeEx(pvReserved: *mut c_void, dwCoInit: DWORD) -> HRESULT;
+            fn CoUninitialize();
+            fn CoCreateInstance(
+                rclsid: *const GUID,
+                pUnkOuter: *mut c_void,
+                dwClsContext: DWORD,
+                riid: *const GUID,
+                ppv: *mut *mut c_void,
+            ) -> HRESULT;
+            fn CoTaskMemFree(pv: *mut c_void);
+            fn PropVariantClear(pvar: *mut PROPVARIANT) -> HRESULT;
+        }
+    }
 }
 
-unsafe impl Send for WinLibs {}
-unsafe impl Sync for WinLibs {}
+/// The symbols `Ole32` binds, for [`bind_error`]'s `SymbolMissing` naming.
+const OLE32_SYMBOLS: &[&str] = &[
+    "CoInitializeEx",
+    "CoUninitialize",
+    "CoCreateInstance",
+    "CoTaskMemFree",
+    "PropVariantClear",
+];
+
+dlsym::library! {
+    /// `kernel32.dll` — the event the render thread blocks on.
+    struct Kernel32 {
+        unsafe extern "system" {
+            fn CreateEventA(
+                lpEventAttributes: *mut c_void,
+                bManualReset: BOOL,
+                bInitialState: BOOL,
+                lpName: *const c_char,
+            ) -> HANDLE;
+            fn CloseHandle(hObject: HANDLE) -> BOOL;
+            fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: DWORD) -> DWORD;
+            fn SetEvent(hEvent: HANDLE) -> BOOL;
+        }
+    }
+}
+
+/// The symbols `Kernel32` binds, for [`bind_error`]'s `SymbolMissing` naming.
+const KERNEL32_SYMBOLS: &[&str] = &[
+    "CreateEventA",
+    "CloseHandle",
+    "WaitForSingleObject",
+    "SetEvent",
+];
+
+struct WinLibs {
+    ole32: Ole32,
+    kernel32: Kernel32,
+}
 
 impl WinLibs {
-    fn load() -> Result<Arc<Self>> {
-        unsafe {
-            let ole32 = Library::new("ole32.dll").map_err(|e| Error::LibraryLoad {
-                backend: "wasapi",
-                soname: "ole32.dll",
-                source: e,
-            })?;
-            let kernel32 = Library::new("kernel32.dll").map_err(|e| Error::LibraryLoad {
+    fn load_default() -> Result<Arc<Self>> {
+        // SAFETY: the system DLLs' `DllMain`s are trusted (both are
+        // already mapped into every Win32 process).
+        let ole32 = unsafe { Library::open("ole32.dll") }.map_err(|e| Error::LibraryLoad {
+            backend: "wasapi",
+            soname: "ole32.dll",
+            source: e,
+        })?;
+        let ole32 = <Ole32 as Bindings>::load(ole32)
+            .map_err(|e| bind_error("wasapi", "ole32.dll", OLE32_SYMBOLS, e))?;
+        // SAFETY: as above.
+        let kernel32 =
+            unsafe { Library::open("kernel32.dll") }.map_err(|e| Error::LibraryLoad {
                 backend: "wasapi",
                 soname: "kernel32.dll",
                 source: e,
             })?;
-            macro_rules! sym {
-                ($lib:ident, $name:literal, $ty:ty) => {{
-                    let s: Symbol<$ty> =
-                        $lib.get(concat!($name, "\0").as_bytes()).map_err(|e| {
-                            Error::SymbolMissing {
-                                backend: "wasapi",
-                                symbol: $name,
-                                source: e,
-                            }
-                        })?;
-                    *s
-                }};
-            }
-            Ok(Arc::new(WinLibs {
-                CoInitializeEx: sym!(ole32, "CoInitializeEx", Fn_CoInitializeEx),
-                CoUninitialize: sym!(ole32, "CoUninitialize", Fn_CoUninitialize),
-                CoCreateInstance: sym!(ole32, "CoCreateInstance", Fn_CoCreateInstance),
-                CoTaskMemFree: sym!(ole32, "CoTaskMemFree", Fn_CoTaskMemFree),
-                PropVariantClear: sym!(ole32, "PropVariantClear", Fn_PropVariantClear),
-                CreateEventA: sym!(kernel32, "CreateEventA", Fn_CreateEventA),
-                CloseHandle: sym!(kernel32, "CloseHandle", Fn_CloseHandle),
-                WaitForSingleObject: sym!(kernel32, "WaitForSingleObject", Fn_WaitForSingleObject),
-                SetEvent: sym!(kernel32, "SetEvent", Fn_SetEvent),
-                _ole32: ole32,
-                _kernel32: kernel32,
-            }))
-        }
+        let kernel32 = <Kernel32 as Bindings>::load(kernel32)
+            .map_err(|e| bind_error("wasapi", "kernel32.dll", KERNEL32_SYMBOLS, e))?;
+        Ok(Arc::new(WinLibs { ole32, kernel32 }))
     }
 }
 
@@ -474,7 +474,7 @@ fn lib() -> Result<Arc<WinLibs>> {
     if let Some(l) = g.as_ref() {
         return Ok(l.clone());
     }
-    let l = WinLibs::load()?;
+    let l = WinLibs::load_default()?;
     *g = Some(l.clone());
     Ok(l)
 }
@@ -494,7 +494,10 @@ unsafe fn com_release(obj: *mut c_void) {
 // S_OK, S_FALSE (already initialized — still fine), or RPC_E_CHANGED_MODE
 // which we tolerate.
 unsafe fn co_init(l: &WinLibs) -> HRESULT {
-    unsafe { (l.CoInitializeEx)(ptr::null_mut(), COINIT_MULTITHREADED) }
+    unsafe {
+        l.ole32
+            .CoInitializeEx(ptr::null_mut(), COINIT_MULTITHREADED)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -508,7 +511,7 @@ impl Backend for WasapiBackend {
         "wasapi"
     }
     fn description(&self) -> &'static str {
-        "WASAPI (ole32.dll + mmdevapi via libloading, shared mode, event-driven)"
+        "WASAPI (ole32.dll + mmdevapi via dlsym, shared mode, event-driven)"
     }
 
     fn probe(&self) -> Result<()> {
@@ -517,7 +520,7 @@ impl Backend for WasapiBackend {
             co_init(&l);
             let (client, _wfx) = activate_client(&l, None)?;
             com_release(client);
-            (l.CoUninitialize)();
+            l.ole32.CoUninitialize();
         }
         Ok(())
     }
@@ -548,7 +551,7 @@ impl Backend for WasapiBackend {
                 let channels = (*pwfx).nChannels;
                 let sample_rate = (*pwfx).nSamplesPerSec;
                 let inspected = inspect_format(pwfx);
-                (l.CoTaskMemFree)(pwfx as *mut c_void);
+                l.ole32.CoTaskMemFree(pwfx as *mut c_void);
                 com_release(client);
                 let (is_float, bits) = inspected.ok_or(Error::UnsupportedFormat {
                     backend: "wasapi",
@@ -568,7 +571,7 @@ impl Backend for WasapiBackend {
                     format: SampleFormat::F32,
                 })
             })();
-            (l.CoUninitialize)();
+            l.ole32.CoUninitialize();
             result
         }
     }
@@ -619,7 +622,7 @@ unsafe fn device_friendly_name(l: &WinLibs, device: *mut c_void) -> String {
         };
         // Free the PROPVARIANT's owned string regardless of VT (no-op on the
         // empty/error case) then release the store.
-        let _ = (l.PropVariantClear)(&mut pv);
+        let _ = l.ole32.PropVariantClear(&mut pv);
         com_release(store);
         name
     }
@@ -637,7 +640,7 @@ unsafe fn device_id_string(l: &WinLibs, device: *mut c_void) -> String {
             return String::new();
         }
         let s = wide_to_string(pid);
-        (l.CoTaskMemFree)(pid as *mut c_void);
+        l.ole32.CoTaskMemFree(pid as *mut c_void);
         s
     }
 }
@@ -650,7 +653,7 @@ unsafe fn enumerate_output_devices(l: &WinLibs) -> Result<Vec<Device>> {
         co_init(l);
 
         let mut enumer: *mut c_void = ptr::null_mut();
-        let hr = (l.CoCreateInstance)(
+        let hr = l.ole32.CoCreateInstance(
             &CLSID_MMDeviceEnumerator,
             ptr::null_mut(),
             CLSCTX_ALL,
@@ -658,7 +661,7 @@ unsafe fn enumerate_output_devices(l: &WinLibs) -> Result<Vec<Device>> {
             &mut enumer,
         );
         if hr != S_OK || enumer.is_null() {
-            (l.CoUninitialize)();
+            l.ole32.CoUninitialize();
             return Err(Error::Runtime {
                 backend: "wasapi",
                 detail: format!("CoCreateInstance(MMDeviceEnumerator) HRESULT=0x{hr:08X}"),
@@ -693,7 +696,7 @@ unsafe fn enumerate_output_devices(l: &WinLibs) -> Result<Vec<Device>> {
         );
         if hr != S_OK || collection.is_null() {
             com_release(enumer);
-            (l.CoUninitialize)();
+            l.ole32.CoUninitialize();
             return Err(Error::Runtime {
                 backend: "wasapi",
                 detail: format!("EnumAudioEndpoints HRESULT=0x{hr:08X}"),
@@ -706,7 +709,7 @@ unsafe fn enumerate_output_devices(l: &WinLibs) -> Result<Vec<Device>> {
         let hr = ((*coll_vtbl).GetCount)(collection, &mut count);
         if hr != S_OK {
             com_release(collection);
-            (l.CoUninitialize)();
+            l.ole32.CoUninitialize();
             return Err(Error::Runtime {
                 backend: "wasapi",
                 detail: format!("IMMDeviceCollection::GetCount HRESULT=0x{hr:08X}"),
@@ -732,7 +735,7 @@ unsafe fn enumerate_output_devices(l: &WinLibs) -> Result<Vec<Device>> {
         }
 
         com_release(collection);
-        (l.CoUninitialize)();
+        l.ole32.CoUninitialize();
         Ok(out)
     }
 }
@@ -752,7 +755,7 @@ unsafe fn activate_client(
     unsafe {
         // 1. CoCreateInstance(CLSID_MMDeviceEnumerator, …, IID_IMMDeviceEnumerator)
         let mut enumer: *mut c_void = ptr::null_mut();
-        let hr = (l.CoCreateInstance)(
+        let hr = l.ole32.CoCreateInstance(
             &CLSID_MMDeviceEnumerator,
             ptr::null_mut(),
             CLSCTX_ALL,
@@ -902,7 +905,7 @@ unsafe fn open_inner(
         let (is_float, bits) = match inspect_format(pwfx) {
             Some(v) => v,
             None => {
-                (l.CoTaskMemFree)(pwfx as *mut c_void);
+                l.ole32.CoTaskMemFree(pwfx as *mut c_void);
                 com_release(client);
                 return Err(Error::UnsupportedFormat {
                     backend: "wasapi",
@@ -915,7 +918,7 @@ unsafe fn open_inner(
         let is_f32 = is_float && bits == 32;
         let is_s16 = !is_float && bits == 16;
         if !is_f32 && !is_s16 {
-            (l.CoTaskMemFree)(pwfx as *mut c_void);
+            l.ole32.CoTaskMemFree(pwfx as *mut c_void);
             com_release(client);
             return Err(Error::UnsupportedFormat {
                 backend: "wasapi",
@@ -942,7 +945,7 @@ unsafe fn open_inner(
             pwfx,
             ptr::null(),
         );
-        (l.CoTaskMemFree)(pwfx as *mut c_void);
+        l.ole32.CoTaskMemFree(pwfx as *mut c_void);
         if hr != S_OK {
             com_release(client);
             return Err(Error::DeviceOpen {
@@ -952,7 +955,7 @@ unsafe fn open_inner(
         }
 
         // Event handle — auto-reset so we block exactly once per buffer fill.
-        let event = (l.CreateEventA)(ptr::null_mut(), 0, 0, ptr::null());
+        let event = l.kernel32.CreateEventA(ptr::null_mut(), 0, 0, ptr::null());
         if event.is_null() {
             com_release(client);
             return Err(Error::DeviceOpen {
@@ -962,7 +965,7 @@ unsafe fn open_inner(
         }
         let hr = ((*client_vtbl).SetEventHandle)(client, event);
         if hr != S_OK {
-            (l.CloseHandle)(event);
+            l.kernel32.CloseHandle(event);
             com_release(client);
             return Err(Error::DeviceOpen {
                 backend: "wasapi",
@@ -973,7 +976,7 @@ unsafe fn open_inner(
         let mut buffer_frames: u32 = 0;
         let hr = ((*client_vtbl).GetBufferSize)(client, &mut buffer_frames);
         if hr != S_OK {
-            (l.CloseHandle)(event);
+            l.kernel32.CloseHandle(event);
             com_release(client);
             return Err(Error::DeviceOpen {
                 backend: "wasapi",
@@ -984,7 +987,7 @@ unsafe fn open_inner(
         let mut render: *mut c_void = ptr::null_mut();
         let hr = ((*client_vtbl).GetService)(client, &IID_IAudioRenderClient, &mut render);
         if hr != S_OK || render.is_null() {
-            (l.CloseHandle)(event);
+            l.kernel32.CloseHandle(event);
             com_release(client);
             return Err(Error::DeviceOpen {
                 backend: "wasapi",
@@ -995,7 +998,7 @@ unsafe fn open_inner(
         let hr = ((*client_vtbl).Start)(client);
         if hr != S_OK {
             com_release(render);
-            (l.CloseHandle)(event);
+            l.kernel32.CloseHandle(event);
             com_release(client);
             return Err(Error::DeviceOpen {
                 backend: "wasapi",
@@ -1144,7 +1147,7 @@ impl WasapiWorkerState {
             while !self.stop.load(Ordering::Relaxed) {
                 // 100 ms timeout so we notice `stop` promptly even if
                 // the server stops pulling.
-                let w = (self.lib.WaitForSingleObject)(self.event.0, 100);
+                let w = self.lib.kernel32.WaitForSingleObject(self.event.0, 100);
                 if w != WAIT_OBJECT_0 && w != 258
                 /* WAIT_TIMEOUT */
                 {
@@ -1338,7 +1341,7 @@ impl StreamImpl for WasapiStream {
     fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         unsafe {
-            let _ = (self.lib.SetEvent)(self.event.0);
+            let _ = self.lib.kernel32.SetEvent(self.event.0);
         }
         if let Some(t) = self.thread.take() {
             let _ = t.join();
@@ -1352,11 +1355,11 @@ impl StreamImpl for WasapiStream {
             com_release(self.clock.0);
             com_release(self.render.0);
             com_release(self.client.0);
-            let _ = (self.lib.CloseHandle)(self.event.0);
+            let _ = self.lib.kernel32.CloseHandle(self.event.0);
             // Balance the CoInitializeEx we did in open_inner for this
             // thread. The worker thread didn't co_init, so there's no
             // matching Uninit there — only here.
-            (self.lib.CoUninitialize)();
+            self.lib.ole32.CoUninitialize();
         }
     }
 }

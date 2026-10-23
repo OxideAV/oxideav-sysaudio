@@ -5,6 +5,47 @@
 
 use crate::backend::Backend;
 
+/// Map a `dlsym::library!` load failure onto the crate error.
+///
+/// `names` is the struct's symbol list (the names as the library
+/// exports them); it lets [`Error::SymbolMissing`] keep naming the
+/// symbol as a `&'static str`. A failure that is not about one of those
+/// symbols is reported against the library itself.
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(feature = "alsa", feature = "oss", feature = "pulse")
+    ),
+    all(target_os = "windows", feature = "wasapi"),
+    all(target_os = "macos", feature = "coreaudio")
+))]
+pub(crate) fn bind_error(
+    backend: &'static str,
+    soname: &'static str,
+    names: &[&'static str],
+    source: dlsym::Error,
+) -> crate::Error {
+    let symbol = match &source {
+        dlsym::Error::SymbolNotFound { name, .. } | dlsym::Error::NullSymbol { name } => names
+            .iter()
+            .copied()
+            .find(|n| n.as_bytes() == name.to_bytes()),
+        _ => None,
+    };
+    match symbol {
+        Some(symbol) => crate::Error::SymbolMissing {
+            backend,
+            symbol,
+            source,
+        },
+        None => crate::Error::LibraryLoad {
+            backend,
+            soname,
+            source,
+        },
+    }
+}
+
 #[cfg(all(target_os = "linux", feature = "alsa"))]
 pub(crate) mod alsa;
 #[cfg(all(target_os = "linux", feature = "oss"))]

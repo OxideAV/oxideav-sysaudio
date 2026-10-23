@@ -1,8 +1,8 @@
 //! Pure-Rust audio output with runtime-loaded native backends.
 //!
 //! `oxideav-sysaudio` talks to the platform's audio stack through
-//! `libloading` instead of linking against audio system libraries at
-//! build time. The produced binary has no `libasound`, `libpulse`,
+//! [`dlsym`] (`dlopen` / `LoadLibrary` at run time) instead of linking
+//! against audio system libraries at build time. The produced binary has no `libasound`, `libpulse`,
 //! `ole32`, or `AudioToolbox` entry in its NEEDED list — everything is
 //! `dlopen`'d on first use and the backends fall through to each other
 //! gracefully if a library is missing.

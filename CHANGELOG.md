@@ -10,6 +10,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - edition 2024, MSRV 1.95.
+- *(loader)* Every backend now reaches its native library through the
+  `dlsym` crate instead of `libloading`: ALSA, OSS and PulseAudio on
+  Linux, CoreAudio (AudioToolbox / CoreAudio / CoreFoundation) on macOS,
+  WASAPI (`ole32.dll` + `kernel32.dll`) on Windows. Each backend's symbol
+  set is a `dlsym::library!` struct that owns its library, so a resolved
+  entry point can no longer outlive the mapping; probed symbols (ALSA's
+  name-hint trio and `snd_pcm_hw_params_set_channels_near`) are
+  `#[optional]`. Loading stays lazy and cached; the public API is
+  unchanged except for the error surface below. The `probe()` /
+  `open()` behaviour and `Driver` surface are untouched.
+- *(api)* **Breaking:** `Error::LibraryLoad { source, .. }` and
+  `Error::SymbolMissing { source, .. }` now carry a `dlsym::Error`
+  instead of a `libloading::Error` (`std::error::Error::source()` still
+  returns it). Code that matched on the `libloading` variants or named
+  the type must switch to `dlsym::Error`.
 
 ### Removed
 

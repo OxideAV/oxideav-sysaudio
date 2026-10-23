@@ -3,7 +3,7 @@
 //! Drives `/dev/dsp` directly through the Linux kernel UAPI
 //! (`<sys/soundcard.h>`). Because OSS is a character-device interface
 //! the only thing we need from userspace is libc's `open`/`close`/
-//! `write`/`ioctl` — those are reached via `libloading` the same way the
+//! `write`/`ioctl` — those are reached via `dlsym` the same way the
 //! other Linux backends reach `libasound`/`libpulse-simple`, so the
 //! crate stays free of build-time C linkage.
 //!
@@ -23,8 +23,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use libloading::{Library, Symbol};
+use dlsym::{Bindings, Library};
 
+use super::bind_error;
 use crate::backend::{Backend, Callback};
 use crate::format::{CallbackInfo, SampleFormat, StreamFormat, StreamRequest};
 use crate::stream::StreamImpl;
@@ -45,72 +46,47 @@ use crate::{Error, Result};
 const O_WRONLY: c_int = 1;
 const O_NONBLOCK: c_int = 0o4000;
 
-type Fn_open = unsafe extern "C" fn(path: *const c_char, flags: c_int, mode: c_uint) -> c_int;
-type Fn_close = unsafe extern "C" fn(fd: c_int) -> c_int;
-type Fn_write = unsafe extern "C" fn(fd: c_int, buf: *const c_void, count: usize) -> isize;
-/// `ioctl` is variadic in libc; we only ever pass it a pointer (to an
-/// int that the kernel reads-modifies-writes back into for the OSS
-/// `_IOWR` family), so binding a fixed 3-arg signature is portable.
-type Fn_ioctl = unsafe extern "C" fn(fd: c_int, request: c_ulong_ioctl, arg: *mut c_void) -> c_int;
 /// Glibc declares `ioctl`'s request as `unsigned long` on 64-bit Linux,
 /// the same width as `c_ulong`. We use a local alias so the binding
 /// matches without dragging the `c_ulong` ambiguity through the rest of
 /// the file.
 type c_ulong_ioctl = u64;
 
-struct OssLib {
-    _libc: Library,
-    open: Fn_open,
-    close: Fn_close,
-    write: Fn_write,
-    ioctl: Fn_ioctl,
+dlsym::library! {
+    /// The four libc entry points that drive a `/dev/dsp` fd.
+    struct OssLib {
+        unsafe extern "C" {
+            fn open(path: *const c_char, flags: c_int, mode: c_uint) -> c_int;
+            fn close(fd: c_int) -> c_int;
+            fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
+            /// `ioctl` is variadic in libc; we only ever pass it a pointer (to an
+            /// int that the kernel reads-modifies-writes back into for the OSS
+            /// `_IOWR` family), so binding a fixed 3-arg signature is portable.
+            fn ioctl(fd: c_int, request: c_ulong_ioctl, arg: *mut c_void) -> c_int;
+        }
+    }
 }
 
-unsafe impl Send for OssLib {}
-unsafe impl Sync for OssLib {}
+/// The symbols `OssLib` binds, for [`bind_error`]'s `SymbolMissing` naming.
+const OSS_SYMBOLS: &[&str] = &["open", "close", "write", "ioctl"];
 
 impl OssLib {
-    fn load() -> Result<Arc<Self>> {
+    fn load_default() -> Result<Arc<Self>> {
         // Same soname candidates as `alsa::load_libc_free` — keep the
         // list in sync. glibc + musl + the BSD-flavoured libc on a few
-        // Linux distros all live behind one of these.
+        // Linux distros all live behind one of these. `open_first`
+        // reports the last candidate's error when none loads.
         const CANDIDATES: &[&str] = &["libc.so.6", "libc.so", "libc.musl-x86_64.so.1"];
-        let mut last_err: Option<libloading::Error> = None;
-        for &name in CANDIDATES {
-            match unsafe { Library::new(name) } {
-                Ok(lib) => unsafe {
-                    macro_rules! sym {
-                        ($n:ident, $t:ty) => {{
-                            let s: std::result::Result<Symbol<$t>, _> =
-                                lib.get(concat!(stringify!($n), "\0").as_bytes());
-                            match s {
-                                Ok(sym) => *sym,
-                                Err(e) => {
-                                    return Err(Error::SymbolMissing {
-                                        backend: "oss",
-                                        symbol: stringify!($n),
-                                        source: e,
-                                    });
-                                }
-                            }
-                        }};
-                    }
-                    return Ok(Arc::new(OssLib {
-                        open: sym!(open, Fn_open),
-                        close: sym!(close, Fn_close),
-                        write: sym!(write, Fn_write),
-                        ioctl: sym!(ioctl, Fn_ioctl),
-                        _libc: lib,
-                    }));
-                },
-                Err(e) => last_err = Some(e),
-            }
-        }
-        Err(Error::LibraryLoad {
+        // SAFETY: libc is already loaded in this process; re-opening it
+        // runs no initialiser we do not already trust.
+        let lib = unsafe { Library::open_first(CANDIDATES) }.map_err(|e| Error::LibraryLoad {
             backend: "oss",
             soname: "libc.so.6",
-            source: last_err.unwrap_or(libloading::Error::DlOpenUnknown),
-        })
+            source: e,
+        })?;
+        <Self as Bindings>::load(lib)
+            .map(Arc::new)
+            .map_err(|e| bind_error("oss", "libc.so.6", OSS_SYMBOLS, e))
     }
 }
 
@@ -121,7 +97,7 @@ fn lib() -> Result<Arc<OssLib>> {
     if let Some(l) = g.as_ref() {
         return Ok(l.clone());
     }
-    let l = OssLib::load()?;
+    let l = OssLib::load_default()?;
     *g = Some(l.clone());
     Ok(l)
 }
@@ -193,7 +169,7 @@ impl Backend for OssBackend {
         "oss"
     }
     fn description(&self) -> &'static str {
-        "OSS / /dev/dsp (libc via libloading)"
+        "OSS / /dev/dsp (libc via dlsym)"
     }
 
     fn probe(&self) -> Result<()> {
@@ -204,14 +180,14 @@ impl Backend for OssBackend {
         // `open()` path does the format negotiation.
         let path = CString::new("/dev/dsp").unwrap();
         unsafe {
-            let fd = (l.open)(path.as_ptr(), O_WRONLY | O_NONBLOCK, 0);
+            let fd = l.open(path.as_ptr(), O_WRONLY | O_NONBLOCK, 0);
             if fd < 0 {
                 return Err(Error::DeviceOpen {
                     backend: "oss",
                     detail: "open(/dev/dsp): errno set".into(),
                 });
             }
-            (l.close)(fd);
+            l.close(fd);
         }
         Ok(())
     }
@@ -230,7 +206,7 @@ impl Backend for OssBackend {
         // Blocking write semantics on the worker thread match what the
         // ALSA + PulseAudio backends do; the worker stops when the atomic
         // flag flips.
-        let fd = unsafe { (l.open)(path.as_ptr(), O_WRONLY, 0) };
+        let fd = unsafe { l.open(path.as_ptr(), O_WRONLY, 0) };
         if fd < 0 {
             return Err(Error::DeviceOpen {
                 backend: "oss",
@@ -244,7 +220,7 @@ impl Backend for OssBackend {
         match res {
             Ok(stream) => Ok(stream),
             Err(e) => {
-                unsafe { (l.close)(fd) };
+                unsafe { l.close(fd) };
                 Err(e)
             }
         }
@@ -262,7 +238,7 @@ fn configure_and_spawn(
     // the granted value back through the same pointer. Each call here
     // therefore both requests and discovers.
     let mut fmt: c_int = AFMT_S16_LE;
-    if unsafe { (l.ioctl)(fd, SNDCTL_DSP_SETFMT, &mut fmt as *mut c_int as *mut c_void) } < 0
+    if unsafe { l.ioctl(fd, SNDCTL_DSP_SETFMT, &mut fmt as *mut c_int as *mut c_void) } < 0
         || fmt != AFMT_S16_LE
     {
         return Err(Error::UnsupportedFormat {
@@ -273,7 +249,7 @@ fn configure_and_spawn(
 
     let mut channels: c_int = req.channels.clamp(1, 8) as c_int;
     if unsafe {
-        (l.ioctl)(
+        l.ioctl(
             fd,
             SNDCTL_DSP_CHANNELS,
             &mut channels as *mut c_int as *mut c_void,
@@ -288,7 +264,7 @@ fn configure_and_spawn(
     }
 
     let mut rate: c_int = req.sample_rate as c_int;
-    if unsafe { (l.ioctl)(fd, SNDCTL_DSP_SPEED, &mut rate as *mut c_int as *mut c_void) } < 0
+    if unsafe { l.ioctl(fd, SNDCTL_DSP_SPEED, &mut rate as *mut c_int as *mut c_void) } < 0
         || rate <= 0
     {
         return Err(Error::UnsupportedFormat {
@@ -391,8 +367,10 @@ impl OssWorkerState {
             convert_f32_to_s16(&f32_buf, &mut s16_buf);
 
             let bytes = s16_buf.len() * 2;
-            let written =
-                unsafe { (self.lib.write)(self.fd, s16_buf.as_ptr() as *const c_void, bytes) };
+            let written = unsafe {
+                self.lib
+                    .write(self.fd, s16_buf.as_ptr() as *const c_void, bytes)
+            };
             if written < 0 {
                 // Errno: -EINTR is the only one that's recoverable per
                 // POSIX; everything else means the device went away.
@@ -473,12 +451,12 @@ impl StreamImpl for OssStream {
             // long-tail buffer (e.g. 200 ms) doesn't want their program
             // to hang at exit waiting for the trailing samples.
             let mut dummy: c_int = 0;
-            let _ = (self.lib.ioctl)(
+            let _ = self.lib.ioctl(
                 self.fd.fd(),
                 SNDCTL_DSP_RESET,
                 &mut dummy as *mut c_int as *mut c_void,
             );
-            (self.lib.close)(self.fd.fd());
+            self.lib.close(self.fd.fd());
         }
     }
 }

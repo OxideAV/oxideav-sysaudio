@@ -10,17 +10,19 @@ pub enum Error {
     NotImplemented(&'static str),
     /// The backend's shared library failed to load (wrong soname, not
     /// installed, permission denied). `probe()` swallows this; `open()`
-    /// surfaces it.
+    /// surfaces it. `source` is the loader's own error (`dlsym::Error`).
     LibraryLoad {
         backend: &'static str,
         soname: &'static str,
-        source: libloading::Error,
+        source: dlsym::Error,
     },
     /// A specific symbol was missing from an otherwise-loaded library.
+    /// `symbol` is the name the backend asked for; `source` carries the
+    /// loader's message.
     SymbolMissing {
         backend: &'static str,
         symbol: &'static str,
-        source: libloading::Error,
+        source: dlsym::Error,
     },
     /// The shared library loaded but opening a device/stream failed.
     /// `detail` is backend-specific (ALSA error string, HRESULT, …).

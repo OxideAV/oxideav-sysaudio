@@ -1,6 +1,6 @@
 //! CoreAudio output backend via the AudioQueue API.
 //!
-//! Loads `AudioToolbox.framework` at runtime through `libloading`
+//! Loads `AudioToolbox.framework` at runtime through `dlsym`
 //! (macOS frameworks are plain dylibs, so
 //! `/System/Library/Frameworks/AudioToolbox.framework/AudioToolbox`
 //! dlopen's cleanly). AudioQueue is the highest-level output API
@@ -34,8 +34,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use libloading::{Library, Symbol};
+use dlsym::{Bindings, Library};
 
+use super::bind_error;
 use crate::backend::{Backend, Callback};
 use crate::format::{CallbackInfo, Device, SampleFormat, StreamFormat, StreamRequest};
 use crate::stream::StreamImpl;
@@ -93,118 +94,83 @@ type AudioQueueOutputCallback = unsafe extern "C" fn(
     inBuffer: AudioQueueBufferRef,
 );
 
-type Fn_AudioQueueNewOutput = unsafe extern "C" fn(
-    inFormat: *const AudioStreamBasicDescription,
-    inCallbackProc: AudioQueueOutputCallback,
-    inUserData: *mut c_void,
-    inCallbackRunLoop: *mut c_void,
-    inCallbackRunLoopMode: *const c_void,
-    inFlags: u32,
-    outAQ: *mut AudioQueueRef,
-) -> OSStatus;
-
-type Fn_AudioQueueAllocateBuffer = unsafe extern "C" fn(
-    inAQ: AudioQueueRef,
-    inBufferByteSize: u32,
-    outBuffer: *mut AudioQueueBufferRef,
-) -> OSStatus;
-
-type Fn_AudioQueueEnqueueBuffer = unsafe extern "C" fn(
-    inAQ: AudioQueueRef,
-    inBuffer: AudioQueueBufferRef,
-    inNumPacketDescs: u32,
-    inPacketDescs: *const c_void,
-) -> OSStatus;
-
-type Fn_AudioQueueStart =
-    unsafe extern "C" fn(inAQ: AudioQueueRef, inStartTime: *const c_void) -> OSStatus;
-
-type Fn_AudioQueueStop = unsafe extern "C" fn(inAQ: AudioQueueRef, inImmediate: u8) -> OSStatus;
-
-type Fn_AudioQueuePause = unsafe extern "C" fn(inAQ: AudioQueueRef) -> OSStatus;
-
-type Fn_AudioQueueDispose = unsafe extern "C" fn(inAQ: AudioQueueRef, inImmediate: u8) -> OSStatus;
-
-/// `AudioQueueSetProperty(inAQ, inID, inData, inDataSize)`. Used to bind
-/// the queue to a specific output device via
-/// `kAudioQueueProperty_CurrentDevice` whose value is a `CFStringRef`
-/// device UID — see `AudioQueue.h` line 271 in the macOS 26 SDK.
-type Fn_AudioQueueSetProperty = unsafe extern "C" fn(
-    inAQ: AudioQueueRef,
-    inID: u32,
-    inData: *const c_void,
-    inDataSize: u32,
-) -> OSStatus;
-
-struct AtLib {
-    _lib: Library,
-    AudioQueueNewOutput: Fn_AudioQueueNewOutput,
-    AudioQueueAllocateBuffer: Fn_AudioQueueAllocateBuffer,
-    AudioQueueEnqueueBuffer: Fn_AudioQueueEnqueueBuffer,
-    AudioQueueStart: Fn_AudioQueueStart,
-    AudioQueueStop: Fn_AudioQueueStop,
-    AudioQueuePause: Fn_AudioQueuePause,
-    AudioQueueDispose: Fn_AudioQueueDispose,
-    AudioQueueSetProperty: Fn_AudioQueueSetProperty,
+dlsym::library! {
+    /// `AudioToolbox.framework` — the AudioQueue output surface. Every
+    /// symbol is required: a framework lacking one of these is not the
+    /// AudioToolbox we know how to drive.
+    struct AtLib {
+        unsafe extern "C" {
+            fn AudioQueueNewOutput(
+                inFormat: *const AudioStreamBasicDescription,
+                inCallbackProc: AudioQueueOutputCallback,
+                inUserData: *mut c_void,
+                inCallbackRunLoop: *mut c_void,
+                inCallbackRunLoopMode: *const c_void,
+                inFlags: u32,
+                outAQ: *mut AudioQueueRef,
+            ) -> OSStatus;
+            fn AudioQueueAllocateBuffer(
+                inAQ: AudioQueueRef,
+                inBufferByteSize: u32,
+                outBuffer: *mut AudioQueueBufferRef,
+            ) -> OSStatus;
+            fn AudioQueueEnqueueBuffer(
+                inAQ: AudioQueueRef,
+                inBuffer: AudioQueueBufferRef,
+                inNumPacketDescs: u32,
+                inPacketDescs: *const c_void,
+            ) -> OSStatus;
+            fn AudioQueueStart(inAQ: AudioQueueRef, inStartTime: *const c_void) -> OSStatus;
+            fn AudioQueueStop(inAQ: AudioQueueRef, inImmediate: u8) -> OSStatus;
+            fn AudioQueuePause(inAQ: AudioQueueRef) -> OSStatus;
+            fn AudioQueueDispose(inAQ: AudioQueueRef, inImmediate: u8) -> OSStatus;
+            /// `AudioQueueSetProperty(inAQ, inID, inData, inDataSize)`. Used to bind
+            /// the queue to a specific output device via
+            /// `kAudioQueueProperty_CurrentDevice` whose value is a `CFStringRef`
+            /// device UID — see `AudioQueue.h` line 271 in the macOS 26 SDK.
+            fn AudioQueueSetProperty(
+                inAQ: AudioQueueRef,
+                inID: u32,
+                inData: *const c_void,
+                inDataSize: u32,
+            ) -> OSStatus;
+        }
+    }
 }
 
-unsafe impl Send for AtLib {}
-unsafe impl Sync for AtLib {}
+/// The symbols `AtLib` binds, for [`bind_error`]'s `SymbolMissing` naming.
+const AT_SYMBOLS: &[&str] = &[
+    "AudioQueueNewOutput",
+    "AudioQueueAllocateBuffer",
+    "AudioQueueEnqueueBuffer",
+    "AudioQueueStart",
+    "AudioQueueStop",
+    "AudioQueuePause",
+    "AudioQueueDispose",
+    "AudioQueueSetProperty",
+];
 
 impl AtLib {
-    fn load() -> Result<Arc<Self>> {
+    fn load_default() -> Result<Arc<Self>> {
         // Try the framework path first (what CoreAudio-typed dylibs
         // usually sit at on macOS) then fall back to the short name
         // for environments that already have it on DYLD_LIBRARY_PATH.
+        // `open_first` reports the last candidate's error when none
+        // loads.
         const CANDIDATES: &[&str] = &[
             "/System/Library/Frameworks/AudioToolbox.framework/AudioToolbox",
             "AudioToolbox.framework/AudioToolbox",
             "AudioToolbox",
         ];
-        let mut last_err: Option<libloading::Error> = None;
-        for &path in CANDIDATES {
-            match unsafe { Library::new(path) } {
-                Ok(lib) => return Self::bind(lib),
-                Err(e) => last_err = Some(e),
-            }
-        }
-        // CANDIDATES is non-empty, so the loop always sets last_err.
-        Err(Error::LibraryLoad {
+        // SAFETY: the system framework's initialisers are trusted.
+        let lib = unsafe { Library::open_first(CANDIDATES) }.map_err(|e| Error::LibraryLoad {
             backend: "coreaudio",
             soname: "AudioToolbox",
-            source: last_err.expect("CANDIDATES is non-empty"),
-        })
-    }
-
-    fn bind(lib: Library) -> Result<Arc<Self>> {
-        unsafe {
-            macro_rules! sym {
-                ($name:ident, $ty:ty) => {{
-                    let s: Symbol<$ty> = lib
-                        .get(concat!(stringify!($name), "\0").as_bytes())
-                        .map_err(|e| Error::SymbolMissing {
-                            backend: "coreaudio",
-                            symbol: stringify!($name),
-                            source: e,
-                        })?;
-                    *s
-                }};
-            }
-            Ok(Arc::new(AtLib {
-                AudioQueueNewOutput: sym!(AudioQueueNewOutput, Fn_AudioQueueNewOutput),
-                AudioQueueAllocateBuffer: sym!(
-                    AudioQueueAllocateBuffer,
-                    Fn_AudioQueueAllocateBuffer
-                ),
-                AudioQueueEnqueueBuffer: sym!(AudioQueueEnqueueBuffer, Fn_AudioQueueEnqueueBuffer),
-                AudioQueueStart: sym!(AudioQueueStart, Fn_AudioQueueStart),
-                AudioQueueStop: sym!(AudioQueueStop, Fn_AudioQueueStop),
-                AudioQueuePause: sym!(AudioQueuePause, Fn_AudioQueuePause),
-                AudioQueueDispose: sym!(AudioQueueDispose, Fn_AudioQueueDispose),
-                AudioQueueSetProperty: sym!(AudioQueueSetProperty, Fn_AudioQueueSetProperty),
-                _lib: lib,
-            }))
-        }
+            source: e,
+        })?;
+        <Self as Bindings>::load(lib)
+            .map(Arc::new)
+            .map_err(|e| bind_error("coreaudio", "AudioToolbox", AT_SYMBOLS, e))
     }
 }
 
@@ -215,7 +181,7 @@ fn lib() -> Result<Arc<AtLib>> {
     if let Some(l) = g.as_ref() {
         return Ok(l.clone());
     }
-    let l = AtLib::load()?;
+    let l = AtLib::load_default()?;
     *g = Some(l.clone());
     Ok(l)
 }
@@ -305,75 +271,52 @@ const kAudioDevicePropertyNominalSampleRate: u32 = four_cc(b"nsrt");
 // expose multiple streams).
 const kAudioStreamPropertyVirtualFormat: u32 = four_cc(b"sfmt");
 
-/// `AudioObjectGetPropertyData(inObjectID, inAddress, 0, NULL,
-/// ioDataSize, outData)` — the getter every HAL query funnels
-/// through. The two `UInt32` args after the address are the
-/// "qualifier" pair (we always pass (0, NULL)).
-type Fn_AudioObjectGetPropertyData = unsafe extern "C" fn(
-    inObjectID: AudioObjectID,
-    inAddress: *const AudioObjectPropertyAddress,
-    inQualifierDataSize: u32,
-    inQualifierData: *const c_void,
-    ioDataSize: *mut u32,
-    outData: *mut c_void,
-) -> OSStatus;
-
-/// `AudioObjectGetPropertyDataSize(inObjectID, inAddress, 0, NULL,
-/// outDataSize)` — the HAL's dedicated size query for variable-length
-/// properties (device lists, stream lists, C-string names): the
-/// documented way to learn a property's byte size before allocating.
-/// Calling `AudioObjectGetPropertyData` with a NULL `outData` is NOT a
-/// size query — on current macOS every such call fails (observed
-/// empirically on 2026-07 hardware), which made device enumeration
-/// silently return an empty list.
-type Fn_AudioObjectGetPropertyDataSize = unsafe extern "C" fn(
-    inObjectID: AudioObjectID,
-    inAddress: *const AudioObjectPropertyAddress,
-    inQualifierDataSize: u32,
-    inQualifierData: *const c_void,
-    outDataSize: *mut u32,
-) -> OSStatus;
-
-struct CaLib {
-    _lib: Library,
-    AudioObjectGetPropertyData: Fn_AudioObjectGetPropertyData,
-    AudioObjectGetPropertyDataSize: Fn_AudioObjectGetPropertyDataSize,
+dlsym::library! {
+    /// `CoreAudio.framework` (the HAL) — property getters only.
+    struct CaLib {
+        unsafe extern "C" {
+            /// `AudioObjectGetPropertyData(inObjectID, inAddress, 0, NULL,
+            /// ioDataSize, outData)` — the getter every HAL query funnels
+            /// through. The two `UInt32` args after the address are the
+            /// "qualifier" pair (we always pass (0, NULL)).
+            fn AudioObjectGetPropertyData(
+                inObjectID: AudioObjectID,
+                inAddress: *const AudioObjectPropertyAddress,
+                inQualifierDataSize: u32,
+                inQualifierData: *const c_void,
+                ioDataSize: *mut u32,
+                outData: *mut c_void,
+            ) -> OSStatus;
+            /// `AudioObjectGetPropertyDataSize(inObjectID, inAddress, 0, NULL,
+            /// outDataSize)` — the HAL's dedicated size query for variable-length
+            /// properties (device lists, stream lists, C-string names): the
+            /// documented way to learn a property's byte size before allocating.
+            /// Calling `AudioObjectGetPropertyData` with a NULL `outData` is NOT a
+            /// size query — on current macOS every such call fails (observed
+            /// empirically on 2026-07 hardware), which made device enumeration
+            /// silently return an empty list.
+            fn AudioObjectGetPropertyDataSize(
+                inObjectID: AudioObjectID,
+                inAddress: *const AudioObjectPropertyAddress,
+                inQualifierDataSize: u32,
+                inQualifierData: *const c_void,
+                outDataSize: *mut u32,
+            ) -> OSStatus;
+        }
+    }
 }
 
-unsafe impl Send for CaLib {}
-unsafe impl Sync for CaLib {}
-
 impl CaLib {
-    fn load() -> std::result::Result<Arc<Self>, libloading::Error> {
+    fn load_default() -> dlsym::Result<Arc<Self>> {
         const CANDIDATES: &[&str] = &[
             "/System/Library/Frameworks/CoreAudio.framework/CoreAudio",
             "CoreAudio.framework/CoreAudio",
             "CoreAudio",
         ];
-        let mut last_err: Option<libloading::Error> = None;
-        for &path in CANDIDATES {
-            match unsafe { Library::new(path) } {
-                Ok(lib) => return Self::bind(lib),
-                Err(e) => last_err = Some(e),
-            }
-        }
-        Err(last_err.expect("CANDIDATES is non-empty"))
-    }
-
-    fn bind(lib: Library) -> std::result::Result<Arc<Self>, libloading::Error> {
-        unsafe {
-            let s: Symbol<Fn_AudioObjectGetPropertyData> =
-                lib.get(b"AudioObjectGetPropertyData\0")?;
-            let f = *s;
-            let s_size: Symbol<Fn_AudioObjectGetPropertyDataSize> =
-                lib.get(b"AudioObjectGetPropertyDataSize\0")?;
-            let f_size = *s_size;
-            Ok(Arc::new(CaLib {
-                AudioObjectGetPropertyData: f,
-                AudioObjectGetPropertyDataSize: f_size,
-                _lib: lib,
-            }))
-        }
+        // SAFETY: the system framework's initialisers are trusted.
+        unsafe { Library::open_first(CANDIDATES) }
+            .and_then(<Self as Bindings>::load)
+            .map(Arc::new)
     }
 }
 
@@ -388,7 +331,7 @@ fn ca_lib() -> Option<Arc<CaLib>> {
     if let Some(slot) = g.as_ref() {
         return slot.clone();
     }
-    let loaded = CaLib::load().ok();
+    let loaded = CaLib::load_default().ok();
     *g = Some(loaded.clone());
     loaded
 }
@@ -412,42 +355,26 @@ struct OpaqueCFType {
 /// CFTypeRef / CFStringRef — both are opaque pointers from our POV.
 type CFTypeRef = *const OpaqueCFType;
 
-type Fn_CFRelease = unsafe extern "C" fn(cf: CFTypeRef);
-
-struct CfLib {
-    _lib: Library,
-    CFRelease: Fn_CFRelease,
+dlsym::library! {
+    /// `CoreFoundation.framework` — just enough to release a CFString.
+    struct CfLib {
+        unsafe extern "C" {
+            fn CFRelease(cf: CFTypeRef);
+        }
+    }
 }
 
-unsafe impl Send for CfLib {}
-unsafe impl Sync for CfLib {}
-
 impl CfLib {
-    fn load() -> std::result::Result<Arc<Self>, libloading::Error> {
+    fn load_default() -> dlsym::Result<Arc<Self>> {
         const CANDIDATES: &[&str] = &[
             "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation",
             "CoreFoundation.framework/CoreFoundation",
             "CoreFoundation",
         ];
-        let mut last_err: Option<libloading::Error> = None;
-        for &path in CANDIDATES {
-            match unsafe { Library::new(path) } {
-                Ok(lib) => return Self::bind(lib),
-                Err(e) => last_err = Some(e),
-            }
-        }
-        Err(last_err.expect("CANDIDATES is non-empty"))
-    }
-
-    fn bind(lib: Library) -> std::result::Result<Arc<Self>, libloading::Error> {
-        unsafe {
-            let s: Symbol<Fn_CFRelease> = lib.get(b"CFRelease\0")?;
-            let f = *s;
-            Ok(Arc::new(CfLib {
-                CFRelease: f,
-                _lib: lib,
-            }))
-        }
+        // SAFETY: the system framework's initialisers are trusted.
+        unsafe { Library::open_first(CANDIDATES) }
+            .and_then(<Self as Bindings>::load)
+            .map(Arc::new)
     }
 }
 
@@ -463,7 +390,7 @@ fn cf_lib() -> Option<Arc<CfLib>> {
     if let Some(slot) = g.as_ref() {
         return slot.clone();
     }
-    let loaded = CfLib::load().ok();
+    let loaded = CfLib::load_default().ok();
     *g = Some(loaded.clone());
     loaded
 }
@@ -483,7 +410,7 @@ unsafe fn hal_get_device_uid(ca: &CaLib, device: AudioObjectID) -> Option<CFType
         };
         let mut value: CFTypeRef = ptr::null();
         let mut size: u32 = std::mem::size_of::<CFTypeRef>() as u32;
-        let r = (ca.AudioObjectGetPropertyData)(
+        let r = ca.AudioObjectGetPropertyData(
             device,
             &addr,
             0,
@@ -510,7 +437,7 @@ unsafe fn hal_get_u32(ca: &CaLib, object: AudioObjectID, selector: u32, scope: u
         };
         let mut value: u32 = 0;
         let mut size: u32 = std::mem::size_of::<u32>() as u32;
-        let r = (ca.AudioObjectGetPropertyData)(
+        let r = ca.AudioObjectGetPropertyData(
             object,
             &addr,
             0,
@@ -542,13 +469,13 @@ unsafe fn hal_first_output_stream(ca: &CaLib, device: AudioObjectID) -> Option<A
         // byte size, then allocate and query the data. The HAL insists on
         // this even when we only want one element.
         let mut size: u32 = 0;
-        let r = (ca.AudioObjectGetPropertyDataSize)(device, &addr, 0, ptr::null(), &mut size);
+        let r = ca.AudioObjectGetPropertyDataSize(device, &addr, 0, ptr::null(), &mut size);
         if r != 0 || size < std::mem::size_of::<AudioObjectID>() as u32 {
             return None;
         }
         let count = size as usize / std::mem::size_of::<AudioObjectID>();
         let mut buf: Vec<AudioObjectID> = vec![0; count];
-        let r = (ca.AudioObjectGetPropertyData)(
+        let r = ca.AudioObjectGetPropertyData(
             device,
             &addr,
             0,
@@ -591,7 +518,7 @@ unsafe fn query_hardware_latency_frames(
                 };
                 let mut device: AudioObjectID = 0;
                 let mut size: u32 = std::mem::size_of::<AudioObjectID>() as u32;
-                let r = (ca.AudioObjectGetPropertyData)(
+                let r = ca.AudioObjectGetPropertyData(
                     kAudioObjectSystemObject,
                     &default_addr,
                     0,
@@ -684,7 +611,7 @@ unsafe fn hal_all_devices(ca: &CaLib) -> Vec<AudioObjectID> {
             mElement: kAudioObjectPropertyElementMain,
         };
         let mut size: u32 = 0;
-        let r = (ca.AudioObjectGetPropertyDataSize)(
+        let r = ca.AudioObjectGetPropertyDataSize(
             kAudioObjectSystemObject,
             &addr,
             0,
@@ -696,7 +623,7 @@ unsafe fn hal_all_devices(ca: &CaLib) -> Vec<AudioObjectID> {
         }
         let count = size as usize / std::mem::size_of::<AudioObjectID>();
         let mut buf: Vec<AudioObjectID> = vec![0; count];
-        let r = (ca.AudioObjectGetPropertyData)(
+        let r = ca.AudioObjectGetPropertyData(
             kAudioObjectSystemObject,
             &addr,
             0,
@@ -724,7 +651,7 @@ unsafe fn hal_is_output_device(ca: &CaLib, device: AudioObjectID) -> bool {
             mElement: kAudioObjectPropertyElementMain,
         };
         let mut size: u32 = 0;
-        let r = (ca.AudioObjectGetPropertyDataSize)(device, &addr, 0, ptr::null(), &mut size);
+        let r = ca.AudioObjectGetPropertyDataSize(device, &addr, 0, ptr::null(), &mut size);
         r == 0 && size >= std::mem::size_of::<AudioObjectID>() as u32
     }
 }
@@ -741,7 +668,7 @@ unsafe fn hal_device_name(ca: &CaLib, device: AudioObjectID) -> String {
             mElement: kAudioObjectPropertyElementMain,
         };
         let mut size: u32 = 0;
-        let r = (ca.AudioObjectGetPropertyDataSize)(device, &addr, 0, ptr::null(), &mut size);
+        let r = ca.AudioObjectGetPropertyDataSize(device, &addr, 0, ptr::null(), &mut size);
         if r != 0 || size == 0 {
             return String::new();
         }
@@ -749,7 +676,7 @@ unsafe fn hal_device_name(ca: &CaLib, device: AudioObjectID) -> String {
         let cap = (size as usize).min(4096);
         let mut buf: Vec<u8> = vec![0u8; cap];
         let mut got = cap as u32;
-        let r = (ca.AudioObjectGetPropertyData)(
+        let r = ca.AudioObjectGetPropertyData(
             device,
             &addr,
             0,
@@ -779,7 +706,7 @@ unsafe fn hal_get_f64(ca: &CaLib, object: AudioObjectID, selector: u32, scope: u
         };
         let mut value: f64 = 0.0;
         let mut size: u32 = std::mem::size_of::<f64>() as u32;
-        let r = (ca.AudioObjectGetPropertyData)(
+        let r = ca.AudioObjectGetPropertyData(
             object,
             &addr,
             0,
@@ -809,7 +736,7 @@ unsafe fn hal_get_asbd(ca: &CaLib, stream: AudioObjectID) -> Option<AudioStreamB
         };
         let mut value = AudioStreamBasicDescription::default();
         let mut size: u32 = std::mem::size_of::<AudioStreamBasicDescription>() as u32;
-        let r = (ca.AudioObjectGetPropertyData)(
+        let r = ca.AudioObjectGetPropertyData(
             stream,
             &addr,
             0,
@@ -836,7 +763,7 @@ unsafe fn hal_default_output_device(ca: &CaLib) -> AudioObjectID {
         };
         let mut device: AudioObjectID = 0;
         let mut size: u32 = std::mem::size_of::<AudioObjectID>() as u32;
-        let r = (ca.AudioObjectGetPropertyData)(
+        let r = ca.AudioObjectGetPropertyData(
             kAudioObjectSystemObject,
             &addr,
             0,
@@ -881,7 +808,7 @@ impl Backend for CoreAudioBackend {
         "coreaudio"
     }
     fn description(&self) -> &'static str {
-        "CoreAudio (AudioToolbox.framework via libloading, AudioQueue output)"
+        "CoreAudio (AudioToolbox.framework via dlsym, AudioQueue output)"
     }
 
     fn probe(&self) -> Result<()> {
@@ -892,7 +819,7 @@ impl Backend for CoreAudioBackend {
             // The callback is never invoked for a probe (we dispose
             // before Start), so a no-op trampoline suffices. Userdata
             // is null; the callback never reads it.
-            let r = (l.AudioQueueNewOutput)(
+            let r = l.AudioQueueNewOutput(
                 &asbd,
                 probe_noop_cb,
                 ptr::null_mut(),
@@ -907,7 +834,7 @@ impl Backend for CoreAudioBackend {
                     detail: format!("AudioQueueNewOutput OSStatus={r}"),
                 });
             }
-            (l.AudioQueueDispose)(queue, 1);
+            l.AudioQueueDispose(queue, 1);
         }
         Ok(())
     }
@@ -1085,14 +1012,14 @@ unsafe extern "C" fn output_trampoline(
         // Re-enqueue — without this, CA stops calling us after three
         // buffers (the ones we pre-allocated).
         if let Some(l) = LIB_FOR_CALLBACK.get() {
-            let _ = (l.AudioQueueEnqueueBuffer)(_q, buffer, 0, ptr::null());
+            let _ = l.AudioQueueEnqueueBuffer(_q, buffer, 0, ptr::null());
         }
     }
 }
 
-/// AudioQueue's callback only gives us `inUserData`; `libloading`'s fn
-/// pointers live in `AtLib`, which we'd ordinarily reach through the
-/// state. Stashing the `Arc<AtLib>` once here lets the trampoline stay
+/// AudioQueue's callback only gives us `inUserData`; the resolved
+/// AudioToolbox entry points live in `AtLib`, which we'd ordinarily
+/// reach through the state. Stashing the `Arc<AtLib>` once here lets the trampoline stay
 /// `extern "C"` without widening the userdata pointer.
 static LIB_FOR_CALLBACK: OnceLock<Arc<AtLib>> = OnceLock::new();
 
@@ -1166,7 +1093,7 @@ unsafe fn open_inner(
         let state_ptr = Box::into_raw(state);
 
         let mut queue: AudioQueueRef = ptr::null_mut();
-        let r = (l.AudioQueueNewOutput)(
+        let r = l.AudioQueueNewOutput(
             &asbd,
             output_trampoline,
             state_ptr as *mut c_void,
@@ -1192,7 +1119,7 @@ unsafe fn open_inner(
             let uid = match hal_get_device_uid(ca, *device_id) {
                 Some(u) => u,
                 None => {
-                    (l.AudioQueueDispose)(queue, 1);
+                    l.AudioQueueDispose(queue, 1);
                     drop(Box::from_raw(state_ptr));
                     return Err(Error::UnsupportedFormat {
                         backend: "coreaudio",
@@ -1206,7 +1133,7 @@ unsafe fn open_inner(
             // AudioQueueSetProperty takes a pointer-to-CFStringRef (the property
             // value is CFStringRef, so the inData pointer is `&CFStringRef` and
             // inDataSize is `sizeof(CFStringRef)`).
-            let r = (l.AudioQueueSetProperty)(
+            let r = l.AudioQueueSetProperty(
                 queue,
                 kAudioQueueProperty_CurrentDevice,
                 &uid as *const CFTypeRef as *const c_void,
@@ -1217,9 +1144,9 @@ unsafe fn open_inner(
             // HAL handed us a +1 ref to drop — Apple's get/copy rule: the
             // `kAudioDevicePropertyDeviceUID` docs say "the caller is
             // responsible for releasing the returned CFObject".
-            (cf.CFRelease)(uid);
+            cf.CFRelease(uid);
             if r != 0 {
-                (l.AudioQueueDispose)(queue, 1);
+                l.AudioQueueDispose(queue, 1);
                 drop(Box::from_raw(state_ptr));
                 return Err(Error::DeviceOpen {
                     backend: "coreaudio",
@@ -1240,13 +1167,10 @@ unsafe fn open_inner(
 
         let mut buffers: [AudioQueueBufferRef; NUM_BUFFERS] = [ptr::null_mut(); NUM_BUFFERS];
         for slot in &mut buffers {
-            let r = (l.AudioQueueAllocateBuffer)(
-                queue,
-                bytes_per_buf,
-                slot as *mut AudioQueueBufferRef,
-            );
+            let r =
+                l.AudioQueueAllocateBuffer(queue, bytes_per_buf, slot as *mut AudioQueueBufferRef);
             if r != 0 || slot.is_null() {
-                (l.AudioQueueDispose)(queue, 1);
+                l.AudioQueueDispose(queue, 1);
                 drop(Box::from_raw(state_ptr));
                 return Err(Error::DeviceOpen {
                     backend: "coreaudio",
@@ -1258,12 +1182,12 @@ unsafe fn open_inner(
             let buf = &mut **slot;
             buf.mAudioDataByteSize = bytes_per_buf;
             ptr::write_bytes(buf.mAudioData as *mut u8, 0, bytes_per_buf as usize);
-            (l.AudioQueueEnqueueBuffer)(queue, *slot, 0, ptr::null());
+            l.AudioQueueEnqueueBuffer(queue, *slot, 0, ptr::null());
         }
 
-        let r = (l.AudioQueueStart)(queue, ptr::null());
+        let r = l.AudioQueueStart(queue, ptr::null());
         if r != 0 {
-            (l.AudioQueueDispose)(queue, 1);
+            l.AudioQueueDispose(queue, 1);
             drop(Box::from_raw(state_ptr));
             return Err(Error::DeviceOpen {
                 backend: "coreaudio",
@@ -1346,14 +1270,14 @@ impl StreamImpl for CoreAudioStream {
     fn play(&mut self) -> Result<()> {
         self.paused.store(false, Ordering::Relaxed);
         unsafe {
-            let _ = (self.lib.AudioQueueStart)(self.queue.0, ptr::null());
+            let _ = self.lib.AudioQueueStart(self.queue.0, ptr::null());
         }
         Ok(())
     }
     fn pause(&mut self) -> Result<()> {
         self.paused.store(true, Ordering::Relaxed);
         unsafe {
-            let _ = (self.lib.AudioQueuePause)(self.queue.0);
+            let _ = self.lib.AudioQueuePause(self.queue.0);
         }
         Ok(())
     }
@@ -1388,8 +1312,8 @@ impl StreamImpl for CoreAudioStream {
         unsafe {
             // inImmediate = 1 (true) — stop + flush and guarantee the
             // callback won't fire again after this returns.
-            let _ = (self.lib.AudioQueueStop)(self.queue.0, 1);
-            let _ = (self.lib.AudioQueueDispose)(self.queue.0, 1);
+            let _ = self.lib.AudioQueueStop(self.queue.0, 1);
+            let _ = self.lib.AudioQueueDispose(self.queue.0, 1);
             // Now safe to drop the Box the trampoline was reading.
             drop(Box::from_raw(self.state_ptr));
         }
