@@ -80,11 +80,7 @@ fn preferred_format_reports_and_rejects_alien_ids() {
     assert_eq!(fmt.sample_rate, 48_000);
     assert_eq!(fmt.channels, 2);
     assert_eq!(fmt.format, SampleFormat::F32);
-    let alien = Device {
-        id: "mock:no-such-device".into(),
-        name: "fake".into(),
-        is_default: false,
-    };
+    let alien = Device::new("mock:no-such-device".into(), "fake".into(), false);
     assert!(
         mock_driver().preferred_format(Some(&alien)).is_err(),
         "a fabricated id must not produce a fabricated format"
@@ -223,11 +219,7 @@ fn per_device_routing_accepts_known_and_rejects_fabricated_ids() {
     assert_eq!(s.format().sample_rate, 44_100);
     drop(s);
 
-    let fake = Device {
-        id: "not-a-mock-device".into(),
-        name: "fake".into(),
-        is_default: false,
-    };
+    let fake = Device::new("not-a-mock-device".into(), "fake".into(), false);
     let err = open_on(
         mock_driver(),
         &fake,

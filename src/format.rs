@@ -5,6 +5,7 @@
 //! something else (e.g. S16LE on very old ALSA cards).
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SampleFormat {
     /// 32-bit IEEE 754 float, native endian, interleaved. The only
     /// format the public callback API currently speaks.
@@ -15,6 +16,7 @@ pub enum SampleFormat {
 /// actual format in [`StreamFormat`] if the device can't honor the
 /// request exactly.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct StreamRequest {
     pub sample_rate: u32,
     pub channels: u16,
@@ -53,6 +55,29 @@ pub struct StreamRequest {
 }
 
 impl StreamRequest {
+    /// Set [`StreamRequest::sample_rate`].
+    #[must_use]
+    pub fn with_sample_rate(mut self, v: u32) -> Self {
+        self.sample_rate = v;
+        self
+    }
+
+    /// Set [`StreamRequest::channels`].
+    #[must_use]
+    pub fn with_channels(mut self, v: u16) -> Self {
+        self.channels = v;
+        self
+    }
+
+    /// Set [`StreamRequest::format`].
+    #[must_use]
+    pub fn with_format(mut self, v: SampleFormat) -> Self {
+        self.format = v;
+        self
+    }
+}
+
+impl StreamRequest {
     pub fn new(sample_rate: u32, channels: u16) -> Self {
         Self {
             sample_rate,
@@ -82,18 +107,38 @@ impl StreamRequest {
 /// Actual stream parameters after the backend has reconciled the
 /// request with what the device supports.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct StreamFormat {
     pub sample_rate: u32,
     pub channels: u16,
     pub format: SampleFormat,
 }
 
+impl StreamFormat {
+    /// Build a [`StreamFormat`] from all of its fields.
+    pub fn new(sample_rate: u32, channels: u16, format: SampleFormat) -> Self {
+        Self {
+            sample_rate,
+            channels,
+            format,
+        }
+    }
+}
+
 /// Information passed to the callback alongside the output buffer.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct CallbackInfo {
     /// Monotonic count of frames played on this stream. Useful as a
     /// cheap audio master clock.
     pub frames_played: u64,
+}
+
+impl CallbackInfo {
+    /// Build a [`CallbackInfo`] from all of its fields.
+    pub fn new(frames_played: u64) -> Self {
+        Self { frames_played }
+    }
 }
 
 /// A single output device discovered by a backend's enumeration.
@@ -108,6 +153,7 @@ pub struct CallbackInfo {
 /// `is_default == true` — the one [`crate::default_driver`] / `open()`
 /// would use.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Device {
     /// Backend-native opaque identifier. Format differs per backend; do
     /// not parse it — treat it as an opaque token for logging or
@@ -121,4 +167,15 @@ pub struct Device {
     /// `true` for the system's current default output endpoint — the
     /// device a plain `open_default()` plays through.
     pub is_default: bool,
+}
+
+impl Device {
+    /// Build a [`Device`] from all of its fields.
+    pub fn new(id: String, name: String, is_default: bool) -> Self {
+        Self {
+            id,
+            name,
+            is_default,
+        }
+    }
 }

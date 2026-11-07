@@ -5,6 +5,7 @@ use std::fmt;
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// The selected backend is compiled in as a stub only.
     NotImplemented(&'static str),

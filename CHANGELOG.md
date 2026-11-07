@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of a `libloading::Error` (`std::error::Error::source()` still
   returns it). Code that matched on the `libloading` variants or named
   the type must switch to `dlsym::Error`.
+- API hygiene: `#[non_exhaustive]` on the `Error` and `SampleFormat` enums
+  and on the `StreamRequest`, `StreamFormat`, `CallbackInfo` and `Device`
+  records. Build them with `StreamRequest::new` + `with_*` or the new
+  constructors instead of struct literals.
 
 ### Removed
 
@@ -319,6 +323,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   estimate alone. Falls back to `GetStreamLatency + GetCurrentPadding`
   when the driver shim refuses the `IAudioClock` service or
   `GetFrequency` returns 0.
+- `StreamRequest::with_sample_rate` / `with_channels` / `with_format`;
+  all-field `new(..)` constructors for `StreamFormat`, `CallbackInfo` and
+  `Device`.
 
 ## [0.1.1](https://github.com/OxideAV/oxideav-sysaudio/compare/v0.1.0...v0.1.1) - 2026-04-24
 
